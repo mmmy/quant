@@ -1,0 +1,37 @@
+[project]
+name = "quant-binance-sync"
+version = "0.1.0"
+description = "HTTP-based Binance USD-M futures kline synchronizer for quant research"
+readme = "README.md"
+authors = [
+    { name = "yangqi", email = "531905408@qq.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "polars>=1.31.0",
+    "pyarrow>=20.0.0",
+    "rich>=14.0.0",
+    "typer>=0.16.0",
+]
+
+[project.scripts]
+quant-binance-sync = "quant_binance_sync.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest-asyncio>=1.1.0",
+    "pytest>=8.4.1",
+    "respx>=0.22.0",
+    "ruff>=0.12.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[build-system]
+requires = ["uv_build>=0.8.20,<0.9.0"]
+build-backend = "uv_build"
