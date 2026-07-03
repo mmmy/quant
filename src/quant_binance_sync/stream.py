@@ -9,13 +9,18 @@ from typing import Any, Protocol, TypedDict
 
 from quant_binance_sync.checkpoints import Checkpoint
 from quant_binance_sync.models import Kline
+from quant_binance_sync.normalizer import NormalizeResult
 from quant_binance_sync.sync import checkpoint_key
 
 DEFAULT_STREAM_BASE_URL = "wss://fstream.binance.com/market"
 
 
 class KlineStore(Protocol):
-    def upsert_klines(self, klines: list[Kline]) -> None: ...
+    def upsert_klines(self, klines: list[Kline]) -> NormalizeResult | None: ...
+
+
+class OpenKlineStore(Protocol):
+    def upsert_open_kline(self, kline: Kline) -> None: ...
 
 
 class StreamMessage(TypedDict, total=False):
@@ -60,32 +65,43 @@ def build_combined_stream_urls(
 
 
 def parse_closed_kline_message(message: StreamMessage) -> Kline | None:
+    parsed = parse_kline_message(message)
+    if parsed is None:
+        return None
+
+    kline, is_closed = parsed
+    if not is_closed:
+        return None
+    return kline
+
+
+def parse_kline_message(message: StreamMessage) -> tuple[Kline, bool] | None:
     data = message.get("data", {})
     if data.get("e") != "kline":
         return None
 
     kline = data.get("k", {})
-    if not kline.get("x"):
-        return None
-
     symbol = str(data.get("s") or kline["s"])
     interval = str(kline["i"])
     open_time_ms = int(kline["t"])
-    return Kline(
-        symbol=symbol,
-        interval=interval,
-        open_time=datetime.fromtimestamp(open_time_ms / 1000, tz=UTC),
-        open_time_ms=open_time_ms,
-        open=float(kline["o"]),
-        high=float(kline["h"]),
-        low=float(kline["l"]),
-        close=float(kline["c"]),
-        volume=float(kline["v"]),
-        close_time_ms=int(kline["T"]),
-        quote_volume=float(kline["q"]),
-        trade_count=int(kline["n"]),
-        taker_buy_base_volume=float(kline["V"]),
-        taker_buy_quote_volume=float(kline["Q"]),
+    return (
+        Kline(
+            symbol=symbol,
+            interval=interval,
+            open_time=datetime.fromtimestamp(open_time_ms / 1000, tz=UTC),
+            open_time_ms=open_time_ms,
+            open=float(kline["o"]),
+            high=float(kline["h"]),
+            low=float(kline["l"]),
+            close=float(kline["c"]),
+            volume=float(kline["v"]),
+            close_time_ms=int(kline["T"]),
+            quote_volume=float(kline["q"]),
+            trade_count=int(kline["n"]),
+            taker_buy_base_volume=float(kline["V"]),
+            taker_buy_quote_volume=float(kline["Q"]),
+        ),
+        bool(kline.get("x")),
     )
 
 
@@ -99,6 +115,7 @@ async def stream_closed_klines(
     checkpoint_callback: CheckpointCallback | None = None,
     gap_sync_callback: GapSyncCallback | None = None,
     progress_callback: Callable[[StreamUpdate], None] | None = None,
+    open_kline_store: OpenKlineStore | None = None,
     streams_per_connection: int = 200,
     base_url: str = DEFAULT_STREAM_BASE_URL,
 ) -> StreamResult:
@@ -118,25 +135,34 @@ async def stream_closed_klines(
         saved = 0
         try:
             async for message in source(url):
-                kline = parse_closed_kline_message(message)
-                if kline is None:
+                parsed = parse_kline_message(message)
+                if parsed is None:
                     continue
-                store.upsert_klines([kline])
-                checkpoints[checkpoint_key(kline.symbol, kline.interval)] = Checkpoint(
-                    last_open_time_ms=kline.open_time_ms,
-                    status="active",
-                )
-                if checkpoint_callback is not None:
-                    checkpoint_callback(checkpoints)
-                if progress_callback is not None:
-                    progress_callback(
-                        StreamUpdate(
-                            symbol=kline.symbol,
-                            open_time_ms=kline.open_time_ms,
-                            kline_saved=True,
-                        )
+                kline, is_closed = parsed
+                if not is_closed:
+                    if open_kline_store is not None:
+                        open_kline_store.upsert_open_kline(kline)
+                    continue
+                store_result = store.upsert_klines([kline])
+                checkpoint_open_time_ms = stream_checkpoint_open_time_ms(kline, store_result)
+                saved_count = stream_saved_count(store_result)
+                if checkpoint_open_time_ms is not None:
+                    checkpoints[checkpoint_key(kline.symbol, kline.interval)] = Checkpoint(
+                        last_open_time_ms=checkpoint_open_time_ms,
+                        status="active",
                     )
-                saved += 1
+                    if checkpoint_callback is not None:
+                        checkpoint_callback(checkpoints)
+                if saved_count:
+                    if progress_callback is not None:
+                        progress_callback(
+                            StreamUpdate(
+                                symbol=kline.symbol,
+                                open_time_ms=checkpoint_open_time_ms or kline.open_time_ms,
+                                kline_saved=True,
+                            )
+                        )
+                    saved += saved_count
         finally:
             if gap_sync_callback is not None:
                 result = gap_sync_callback(chunk_symbols)
@@ -156,3 +182,18 @@ async def websocket_message_source(url: str) -> AsyncIterator[StreamMessage]:
     async with websockets.connect(url, ping_interval=20, ping_timeout=20) as websocket:
         async for raw_message in websocket:
             yield json.loads(raw_message)
+
+
+def stream_checkpoint_open_time_ms(
+    kline: Kline,
+    store_result: NormalizeResult | None,
+) -> int | None:
+    if store_result is None:
+        return kline.open_time_ms
+    return store_result.contiguous_last_open_time_ms
+
+
+def stream_saved_count(store_result: NormalizeResult | None) -> int:
+    if store_result is None:
+        return 1
+    return store_result.accepted_count

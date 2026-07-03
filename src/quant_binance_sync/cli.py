@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import typer
@@ -21,11 +22,17 @@ from quant_binance_sync.archive import BinanceVisionArchiveClient
 from quant_binance_sync.client import BinanceFuturesClient
 from quant_binance_sync.checkpoints import Checkpoint
 from quant_binance_sync.checkpoints import CheckpointStore, mark_inactive_checkpoints
+from quant_binance_sync.normalize_existing import NormalizeExistingProgress, normalize_existing_klines
 from quant_binance_sync.rate_limit import AsyncWeightRateLimiter
-from quant_binance_sync.storage import ParquetKlineStore
+from quant_binance_sync.storage import LatestOpenKlineStore, NormalizedKlineStore, ParquetKlineStore
 from quant_binance_sync.stream import StreamResult, StreamUpdate, stream_closed_klines
 from quant_binance_sync.symbols import SymbolMetadataStore, refresh_symbol_metadata
-from quant_binance_sync.sync import ProgressUpdate, estimate_sync_plan, sync_missing_klines
+from quant_binance_sync.sync import (
+    ProgressUpdate,
+    estimate_sync_plan,
+    interval_to_milliseconds,
+    sync_missing_klines,
+)
 
 app = typer.Typer(help="Sync Binance USD-M perpetual futures klines with HTTP polling.")
 
@@ -57,6 +64,9 @@ def sync_klines(
     bootstrap_days: int = typer.Option(30, min=1, help="Days to sync when no checkpoint exists."),
     limit: int = typer.Option(499, min=1, max=1500, help="Candles per Binance request."),
     data_dir: Path = typer.Option(Path("data/raw/binance/usdm_futures/klines")),
+    silver_dir: Path = typer.Option(Path("data/silver/binance/usdm_futures/klines")),
+    quarantine_dir: Path = typer.Option(Path("data/quarantine/binance/usdm_futures/klines")),
+    gap_report_path: Path = typer.Option(Path("data/reports/binance/usdm_futures/kline_gaps.parquet")),
     meta_dir: Path = typer.Option(Path("data/meta/binance"), help="Symbol metadata directory."),
     state_dir: Path = typer.Option(Path("data/state/binance"), help="Checkpoint state directory."),
     symbol: list[str] | None = typer.Option(None, help="Optional symbol filter, repeatable."),
@@ -90,6 +100,9 @@ def sync_klines(
             bootstrap_days=bootstrap_days,
             limit=limit,
             data_dir=data_dir,
+            silver_dir=silver_dir,
+            quarantine_dir=quarantine_dir,
+            gap_report_path=gap_report_path,
             meta_dir=meta_dir,
             state_dir=state_dir,
             symbols=symbol,
@@ -111,6 +124,9 @@ def sync_all(
     bootstrap_days: int = typer.Option(30, min=1, help="Days to sync when no checkpoint exists."),
     limit: int = typer.Option(499, min=1, max=1500, help="Candles per Binance request."),
     data_dir: Path = typer.Option(Path("data/raw/binance/usdm_futures/klines")),
+    silver_dir: Path = typer.Option(Path("data/silver/binance/usdm_futures/klines")),
+    quarantine_dir: Path = typer.Option(Path("data/quarantine/binance/usdm_futures/klines")),
+    gap_report_path: Path = typer.Option(Path("data/reports/binance/usdm_futures/kline_gaps.parquet")),
     meta_dir: Path = typer.Option(Path("data/meta/binance"), help="Symbol metadata directory."),
     state_dir: Path = typer.Option(Path("data/state/binance"), help="Checkpoint state directory."),
     concurrency: int = typer.Option(8, min=1, max=50),
@@ -143,6 +159,9 @@ def sync_all(
             bootstrap_days=bootstrap_days,
             limit=limit,
             data_dir=data_dir,
+            silver_dir=silver_dir,
+            quarantine_dir=quarantine_dir,
+            gap_report_path=gap_report_path,
             meta_dir=meta_dir,
             state_dir=state_dir,
             concurrency=concurrency,
@@ -160,10 +179,105 @@ def sync_all(
     )
 
 
+@app.command("normalize-klines")
+def normalize_klines(
+    interval: str = typer.Option("1m", help="Binance kline interval, e.g. 1m, 5m, 1h."),
+    data_dir: Path = typer.Option(Path("data/raw/binance/usdm_futures/klines")),
+    silver_dir: Path = typer.Option(Path("data/silver/binance/usdm_futures/klines")),
+    quarantine_dir: Path = typer.Option(Path("data/quarantine/binance/usdm_futures/klines")),
+    gap_report_path: Path = typer.Option(Path("data/reports/binance/usdm_futures/kline_gaps.parquet")),
+    symbol: list[str] | None = typer.Option(None, help="Optional symbol filter, repeatable."),
+    start_date: datetime | None = typer.Option(None, help="Optional UTC date lower bound."),
+    end_date: datetime | None = typer.Option(None, help="Optional UTC date upper bound."),
+    overwrite: bool = typer.Option(
+        True,
+        "--overwrite/--append",
+        help="Rebuild silver/quarantine/gap report before normalizing.",
+    ),
+    progress: bool = typer.Option(True, "--progress/--no-progress", help="Show progress bar."),
+) -> None:
+    progress_context = normalize_progress_bar() if progress else nullcontext(None)
+    with progress_context as progress_view:
+        callback = (
+            make_normalize_progress_callback(progress_view)
+            if progress_view is not None
+            else None
+        )
+        result = normalize_existing_klines(
+            raw_dir=data_dir,
+            silver_dir=silver_dir,
+            quarantine_dir=quarantine_dir,
+            gap_report_path=gap_report_path,
+            interval=interval,
+            symbol=symbol,
+            start_date=start_date.date() if start_date is not None else None,
+            end_date=end_date.date() if end_date is not None else None,
+            overwrite=overwrite,
+            progress_callback=callback,
+        )
+    typer.echo(
+        f"files_seen={result.files_seen} raw_klines_seen={result.raw_klines_seen} "
+        f"accepted_klines={result.accepted_klines} rejected_klines={result.rejected_klines} "
+        f"conflict_klines={result.conflict_klines} gaps_seen={result.gaps_seen}"
+    )
+
+
+def normalize_progress_bar() -> Progress:
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        TextColumn("files={task.fields[files]}"),
+        TextColumn("raw={task.fields[raw]}"),
+        TextColumn("accepted={task.fields[accepted]}"),
+        TextColumn("rejected={task.fields[rejected]}"),
+        TextColumn("conflicts={task.fields[conflicts]}"),
+        TextColumn("gaps={task.fields[gaps]}"),
+        TextColumn("current={task.fields[current]}"),
+        TimeRemainingColumn(),
+        TimeElapsedColumn(),
+    )
+
+
+def make_normalize_progress_callback(
+    progress: Progress,
+) -> Callable[[NormalizeExistingProgress], None]:
+    task_id = progress.add_task(
+        "normalize klines",
+        total=None,
+        files="0/0",
+        raw=0,
+        accepted=0,
+        rejected=0,
+        conflicts=0,
+        gaps=0,
+        current="-",
+    )
+
+    def callback(event: NormalizeExistingProgress) -> None:
+        progress.update(
+            task_id,
+            total=event.total_files,
+            completed=event.files_seen,
+            files=f"{event.files_seen}/{event.total_files}",
+            raw=event.raw_klines_seen,
+            accepted=event.accepted_klines,
+            rejected=event.rejected_klines,
+            conflicts=event.conflict_klines,
+            gaps=event.gaps_seen,
+            current=event.current,
+        )
+
+    return callback
+
+
 @app.command("stream-klines")
 def stream_klines(
     interval: str = typer.Option("1m", help="Binance kline interval, e.g. 1m, 5m, 1h."),
     data_dir: Path = typer.Option(Path("data/raw/binance/usdm_futures/klines")),
+    silver_dir: Path = typer.Option(Path("data/silver/binance/usdm_futures/klines")),
+    quarantine_dir: Path = typer.Option(Path("data/quarantine/binance/usdm_futures/klines")),
+    gap_report_path: Path = typer.Option(Path("data/reports/binance/usdm_futures/kline_gaps.parquet")),
+    realtime_dir: Path = typer.Option(Path("data/realtime/binance/usdm_futures/open_klines")),
     meta_dir: Path = typer.Option(Path("data/meta/binance"), help="Symbol metadata directory."),
     state_dir: Path = typer.Option(Path("data/state/binance"), help="Checkpoint state directory."),
     symbol: list[str] | None = typer.Option(None, help="Optional symbol filter, repeatable."),
@@ -204,6 +318,10 @@ def stream_klines(
             _stream_klines(
                 interval=interval,
                 data_dir=data_dir,
+                silver_dir=silver_dir,
+                quarantine_dir=quarantine_dir,
+                gap_report_path=gap_report_path,
+                realtime_dir=realtime_dir,
                 meta_dir=meta_dir,
                 state_dir=state_dir,
                 symbol=symbol,
@@ -235,6 +353,9 @@ async def _sync_klines(
     bootstrap_days: int,
     limit: int,
     data_dir: Path,
+    silver_dir: Path | None,
+    quarantine_dir: Path,
+    gap_report_path: Path,
     meta_dir: Path,
     state_dir: Path,
     symbols: list[str] | None,
@@ -254,7 +375,13 @@ async def _sync_klines(
     checkpoints = checkpoint_store.load()
     mark_inactive_checkpoints(checkpoints, active_symbols=active_symbols, interval=interval)
 
-    kline_store = ParquetKlineStore(data_dir)
+    kline_store = make_normalized_kline_store(
+        data_dir=data_dir,
+        silver_dir=silver_dir,
+        quarantine_dir=quarantine_dir,
+        gap_report_path=gap_report_path,
+        interval=interval,
+    )
     rate_limiter = AsyncWeightRateLimiter(max_weight_per_minute=max_weight_per_minute)
     plan = estimate_sync_plan(
         symbols=selected_symbols,
@@ -304,6 +431,9 @@ async def _sync_all(
     bootstrap_days: int,
     limit: int,
     data_dir: Path,
+    silver_dir: Path | None,
+    quarantine_dir: Path,
+    gap_report_path: Path,
     meta_dir: Path,
     state_dir: Path,
     concurrency: int,
@@ -348,7 +478,13 @@ async def _sync_all(
             async with archive_context as archive_client:
                 result = await sync_missing_klines(
                     client=client,
-                    store=ParquetKlineStore(data_dir),
+                    store=make_normalized_kline_store(
+                        data_dir=data_dir,
+                        silver_dir=silver_dir,
+                        quarantine_dir=quarantine_dir,
+                        gap_report_path=gap_report_path,
+                        interval=interval,
+                    ),
                     checkpoints=checkpoints,
                     interval=interval,
                     bootstrap_days=bootstrap_days,
@@ -370,6 +506,10 @@ async def _stream_klines(
     *,
     interval: str,
     data_dir: Path,
+    silver_dir: Path | None = None,
+    quarantine_dir: Path | None = None,
+    gap_report_path: Path | None = None,
+    realtime_dir: Path | None = None,
     meta_dir: Path,
     state_dir: Path,
     symbol: list[str] | None,
@@ -402,7 +542,18 @@ async def _stream_klines(
     mark_inactive_checkpoints(checkpoints, active_symbols=active_symbols, interval=interval)
     checkpoint_store.save(checkpoints)
 
-    kline_store = ParquetKlineStore(data_dir)
+    kline_store = make_stream_kline_store(
+        data_dir=data_dir,
+        silver_dir=silver_dir,
+        quarantine_dir=quarantine_dir,
+        gap_report_path=gap_report_path,
+        interval=interval,
+    )
+    open_kline_store = (
+        LatestOpenKlineStore(realtime_dir)
+        if realtime_dir is not None
+        else None
+    )
     rate_limiter = AsyncWeightRateLimiter(max_weight_per_minute=max_weight_per_minute)
 
     async def gap_sync_with_checkpoints(
@@ -467,6 +618,7 @@ async def _stream_klines(
             checkpoint_callback=checkpoint_store.save,
             gap_sync_callback=gap_sync,
             progress_callback=make_ws_stream_progress_callback(progress_callback),
+            open_kline_store=open_kline_store,
         )
         total = StreamResult(
             connections_seen=total.connections_seen + result.connections_seen,
@@ -477,6 +629,45 @@ async def _stream_klines(
                 await startup_task
             return total
         await asyncio.sleep(reconnect_delay_seconds)
+
+
+def make_stream_kline_store(
+    *,
+    data_dir: Path,
+    silver_dir: Path | None,
+    quarantine_dir: Path | None = None,
+    gap_report_path: Path | None = None,
+    interval: str,
+):
+    if silver_dir is None:
+        return ParquetKlineStore(data_dir)
+    return make_normalized_kline_store(
+        data_dir=data_dir,
+        silver_dir=silver_dir,
+        quarantine_dir=quarantine_dir or data_dir.parent / "quarantine",
+        gap_report_path=gap_report_path or data_dir.parent / "kline_gaps.parquet",
+        interval=interval,
+    )
+
+
+def make_normalized_kline_store(
+    *,
+    data_dir: Path,
+    silver_dir: Path | None,
+    quarantine_dir: Path,
+    gap_report_path: Path,
+    interval: str,
+):
+    raw_store = ParquetKlineStore(data_dir)
+    if silver_dir is None:
+        return raw_store
+    return NormalizedKlineStore(
+        raw=raw_store,
+        silver=ParquetKlineStore(silver_dir),
+        quarantine=ParquetKlineStore(quarantine_dir),
+        gap_report_path=gap_report_path,
+        interval_ms=interval_to_milliseconds(interval),
+    )
 
 
 def make_merging_checkpoint_callback(

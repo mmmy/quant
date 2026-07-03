@@ -14,6 +14,7 @@ from quant_binance_sync.sync import ProgressUpdate
 from quant_binance_sync.sync import estimate_sync_plan
 from quant_binance_sync.sync import SyncResult, sync_recent_closed_klines
 from quant_binance_sync.sync import sync_missing_klines
+from quant_binance_sync.normalizer import NormalizeResult
 
 
 class MemoryStore:
@@ -169,6 +170,16 @@ class BatchTrackingStore(MemoryStore):
     def upsert_klines(self, klines) -> None:
         self.batch_sizes.append(len(klines))
         super().upsert_klines(klines)
+
+
+class NormalizingMemoryStore(MemoryStore):
+    def __init__(self, result: NormalizeResult) -> None:
+        super().__init__()
+        self.result = result
+
+    def upsert_klines(self, klines):
+        super().upsert_klines(klines)
+        return self.result
 
 
 @pytest.mark.asyncio
@@ -539,3 +550,146 @@ def test_estimate_sync_plan_skips_completed_symbols() -> None:
     )
 
     assert plan.total_batches == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_missing_checkpoint_uses_normalized_contiguous_last_open_time() -> None:
+    client = KlineClient()
+    accepted = Kline(
+        symbol="BTCUSDT",
+        interval="1m",
+        open_time=datetime(2024, 7, 1, 0, 0, 30, tzinfo=UTC),
+        open_time_ms=1719792030000,
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.5,
+        volume=1.0,
+        close_time_ms=1719792089999,
+        quote_volume=100.5,
+        trade_count=7,
+        taker_buy_base_volume=0.5,
+        taker_buy_quote_volume=50.25,
+    )
+    store = NormalizingMemoryStore(
+        NormalizeResult(
+            accepted=[accepted],
+            rejected=[],
+            conflicts=[],
+            gaps=[],
+            contiguous_last_open_time_ms=accepted.open_time_ms - 60_000,
+        )
+    )
+    checkpoints = {}
+
+    result = await sync_missing_klines(
+        client=client,
+        store=store,
+        checkpoints=checkpoints,
+        symbols=["BTCUSDT"],
+        interval="1m",
+        bootstrap_days=1,
+        limit=1500,
+        now=datetime(2024, 7, 2, 0, 0, 30, tzinfo=UTC),
+    )
+
+    assert result == SyncResult(symbols_seen=1, klines_saved=1)
+    assert checkpoints["BTCUSDT|1m"] == Checkpoint(
+        last_open_time_ms=accepted.open_time_ms - 60_000,
+        status="active",
+    )
+
+
+class RejectingNormalizingStore(MemoryStore):
+    def upsert_klines(self, klines):
+        super().upsert_klines(klines)
+        return NormalizeResult(
+            accepted=[],
+            rejected=[],
+            conflicts=[],
+            gaps=[],
+            contiguous_last_open_time_ms=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_sync_missing_stops_when_normalizer_accepts_no_klines() -> None:
+    client = KlineClient()
+    store = RejectingNormalizingStore()
+    checkpoints = {}
+
+    result = await sync_missing_klines(
+        client=client,
+        store=store,
+        checkpoints=checkpoints,
+        symbols=["BTCUSDT"],
+        interval="1m",
+        bootstrap_days=1,
+        limit=1500,
+        now=datetime(2024, 7, 2, 0, 0, 30, tzinfo=UTC),
+    )
+
+    assert result == SyncResult(symbols_seen=1, klines_saved=0)
+    assert len(client.calls) == 1
+    assert checkpoints == {}
+
+
+class SkippingFirstKlineClient(KlineClient):
+    async def klines(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        limit: int,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ):
+        self.calls.append(
+            {
+                "symbol": symbol,
+                "interval": interval,
+                "limit": limit,
+                "start_time_ms": start_time_ms,
+                "end_time_ms": end_time_ms,
+            }
+        )
+        assert start_time_ms is not None
+        returned_open_time_ms = start_time_ms + 60_000
+        return [
+            [
+                returned_open_time_ms,
+                "100",
+                "101",
+                "99",
+                "100.5",
+                "1",
+                returned_open_time_ms + 59999,
+                "100.5",
+                7,
+                "0.5",
+                "50.25",
+                "0",
+            ]
+        ]
+
+
+@pytest.mark.asyncio
+async def test_sync_missing_does_not_advance_checkpoint_when_batch_skips_expected_cursor() -> None:
+    client = SkippingFirstKlineClient()
+    store = MemoryStore()
+    checkpoints = {}
+
+    result = await sync_missing_klines(
+        client=client,
+        store=store,
+        checkpoints=checkpoints,
+        symbols=["BTCUSDT"],
+        interval="1m",
+        bootstrap_days=1,
+        limit=1500,
+        now=datetime(2024, 7, 2, 0, 0, 30, tzinfo=UTC),
+    )
+
+    assert result == SyncResult(symbols_seen=1, klines_saved=1)
+    assert store.saved[0].open_time_ms == client.calls[0]["start_time_ms"] + 60_000
+    assert checkpoints == {}

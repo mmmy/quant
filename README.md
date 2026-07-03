@@ -58,11 +58,12 @@ uv run quant-binance-sync stream-klines --interval 1m
 ```
 
 `stream-klines` subscribes to Binance USD-M combined kline streams for the active USDT perpetual
-symbols, writes only closed candles to the same partitioned Parquet layout, and updates
-checkpoints. By default it opens websocket streams first, then runs startup REST gap-fill in the
-background with the same request weight limiter used by `sync-klines`. This avoids missing candles
-that close while a large startup gap-fill is still running. After each websocket disconnect, it also
-uses REST gap-fill before reconnecting.
+symbols. Unclosed websocket candles update a realtime latest-candle cache only. Closed candles are
+written to raw Parquet and upserted to the silver Parquet layout, then checkpoints are updated. By
+default it opens websocket streams first, then runs startup REST gap-fill in the background with the
+same request weight limiter used by `sync-klines`. This avoids missing candles that close while a
+large startup gap-fill is still running. After each websocket disconnect, it also uses REST gap-fill
+before reconnecting.
 
 For a smoke test that exits after the first disconnect:
 
@@ -95,6 +96,8 @@ Kline Parquet data:
 
 ```text
 data/raw/binance/usdm_futures/klines/interval=1m/symbol=BTCUSDT/date=YYYY-MM-DD/klines.parquet
+data/silver/binance/usdm_futures/klines/interval=1m/symbol=BTCUSDT/date=YYYY-MM-DD/klines.parquet
+data/realtime/binance/usdm_futures/open_klines/interval=1m/symbol=BTCUSDT/open_kline.parquet
 ```
 
 ## First sync size

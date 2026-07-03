@@ -10,10 +10,11 @@ from quant_binance_sync.archive import ArchiveMissing, ArchiveTransientError
 from quant_binance_sync.client import BinanceFuturesClient
 from quant_binance_sync.checkpoints import Checkpoint
 from quant_binance_sync.models import Kline, active_usdm_perpetual_symbols, parse_kline
+from quant_binance_sync.normalizer import NormalizeResult
 
 
 class KlineStore(Protocol):
-    def upsert_klines(self, klines: list[Kline]) -> None: ...
+    def upsert_klines(self, klines: list[Kline]) -> NormalizeResult | None: ...
 
 
 class ArchiveKlineClient(Protocol):
@@ -155,17 +156,28 @@ async def sync_missing_klines(
     semaphore = asyncio.Semaphore(concurrency)
     archive_semaphore = asyncio.Semaphore(archive_concurrency)
 
-    def persist_batch(key: str, klines: list[Kline]) -> int:
+    def persist_batch(key: str, klines: list[Kline], *, expected_start_time_ms: int | None) -> int:
         if not klines:
             return 0
-        store.upsert_klines(klines)
+        store_result = store.upsert_klines(klines)
+        accepted_count = stored_kline_count(klines, store_result)
+        checkpoint_open_time_ms = stored_checkpoint_open_time_ms(klines, store_result)
+        batch_first_open_time_ms = min(kline.open_time_ms for kline in klines)
+        if (
+            checkpoint_open_time_ms is None
+            or (
+                expected_start_time_ms is not None
+                and batch_first_open_time_ms != expected_start_time_ms
+            )
+        ):
+            return accepted_count
         checkpoints[key] = Checkpoint(
-            last_open_time_ms=max(kline.open_time_ms for kline in klines),
+            last_open_time_ms=checkpoint_open_time_ms,
             status="active",
         )
         if checkpoint_callback is not None:
             checkpoint_callback(checkpoints)
-        return len(klines)
+        return accepted_count
 
     async def sync_symbol(symbol: str) -> int:
         key = checkpoint_key(symbol, interval)
@@ -193,11 +205,16 @@ async def sync_missing_klines(
             archive_cutoff = current_time.date() - timedelta(days=archive_threshold_days)
             archive_saved, cursor = await sync_archive_days(
                 archive_client=archive_client,
-                persist_batch=lambda batch: persist_batch(key, batch),
+                persist_batch=lambda batch, expected_start_time_ms: persist_batch(
+                    key,
+                    batch,
+                    expected_start_time_ms=expected_start_time_ms,
+                ),
                 symbol=symbol,
                 interval=interval,
                 start_time_ms=cursor,
                 end_time_ms=end_time_ms,
+                interval_ms=interval_ms,
                 archive_cutoff=archive_cutoff,
                 archive_semaphore=archive_semaphore,
                 progress_callback=progress_callback,
@@ -207,7 +224,11 @@ async def sync_missing_klines(
         rest_saved = await fetch_rest_klines(
             client=client,
             semaphore=semaphore,
-            persist_batch=lambda batch: persist_batch(key, batch),
+            persist_batch=lambda batch, expected_start_time_ms: persist_batch(
+                key,
+                batch,
+                expected_start_time_ms=expected_start_time_ms,
+            ),
             symbol=symbol,
             interval=interval,
             limit=limit,
@@ -235,7 +256,7 @@ async def fetch_rest_klines(
     *,
     client: BinanceFuturesClient,
     semaphore: asyncio.Semaphore,
-    persist_batch: Callable[[list[Kline]], int],
+    persist_batch: Callable[[list[Kline], int | None], int],
     symbol: str,
     interval: str,
     limit: int,
@@ -259,7 +280,7 @@ async def fetch_rest_klines(
                 break
 
             batch = [parse_kline(symbol, interval, row) for row in rows if int(row[0]) <= end_time_ms]
-            saved = persist_batch(batch)
+            saved = persist_batch(batch, cursor)
             klines_saved += saved
             if progress_callback is not None:
                 progress_callback(
@@ -284,11 +305,12 @@ async def fetch_rest_klines(
 async def sync_archive_days(
     *,
     archive_client: ArchiveKlineClient,
-    persist_batch: Callable[[list[Kline]], int],
+    persist_batch: Callable[[list[Kline], int | None], int],
     symbol: str,
     interval: str,
     start_time_ms: int,
     end_time_ms: int,
+    interval_ms: int,
     archive_cutoff: date,
     archive_semaphore: asyncio.Semaphore,
     progress_callback: Callable[[ProgressUpdate], None] | None,
@@ -315,7 +337,10 @@ async def sync_archive_days(
             for kline in batch
             if start_time_ms <= kline.open_time_ms <= end_time_ms
         ]
-        saved = persist_batch(batch)
+        saved = persist_batch(
+            batch,
+            next_aligned_open_time_ms(max(start_time_ms, day_start_ms), interval_ms),
+        )
         klines_saved += saved
         if progress_callback is not None:
             progress_callback(
@@ -331,9 +356,30 @@ def checkpoint_key(symbol: str, interval: str) -> str:
     return f"{symbol}|{interval}"
 
 
+def stored_kline_count(klines: list[Kline], store_result: NormalizeResult | None) -> int:
+    if store_result is None:
+        return len(klines)
+    return store_result.accepted_count
+
+
+def stored_checkpoint_open_time_ms(
+    klines: list[Kline],
+    store_result: NormalizeResult | None,
+) -> int | None:
+    if store_result is None:
+        return max(kline.open_time_ms for kline in klines)
+    return store_result.contiguous_last_open_time_ms
+
+
 def latest_closed_open_time_ms(now: datetime, interval_ms: int) -> int:
     now_ms = int(now.timestamp() * 1000)
     return (now_ms // interval_ms) * interval_ms - interval_ms
+
+
+def next_aligned_open_time_ms(start_time_ms: int, interval_ms: int) -> int:
+    if start_time_ms % interval_ms == 0:
+        return start_time_ms
+    return ((start_time_ms // interval_ms) + 1) * interval_ms
 
 
 def utc_day_start_ms(day: date) -> int:

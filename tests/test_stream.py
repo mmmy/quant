@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import pytest
 
 from quant_binance_sync.checkpoints import Checkpoint
+from quant_binance_sync.normalizer import NormalizeResult
 from quant_binance_sync.stream import (
     StreamMessage,
     StreamUpdate,
@@ -18,6 +19,24 @@ class MemoryStore:
 
     def upsert_klines(self, klines) -> None:
         self.saved.extend(klines)
+
+
+class MemoryOpenKlineStore:
+    def __init__(self) -> None:
+        self.saved = []
+
+    def upsert_open_kline(self, kline) -> None:
+        self.saved.append(kline)
+
+
+class NormalizingMemoryStore(MemoryStore):
+    def __init__(self, result: NormalizeResult) -> None:
+        super().__init__()
+        self.result = result
+
+    def upsert_klines(self, klines):
+        super().upsert_klines(klines)
+        return self.result
 
 
 class MessageSource:
@@ -154,3 +173,56 @@ async def test_stream_closed_klines_reports_progress_for_closed_events() -> None
             kline_saved=True,
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_stream_closed_klines_updates_open_cache_without_saving_unclosed_events() -> None:
+    store = MemoryStore()
+    open_store = MemoryOpenKlineStore()
+    message = closed_message("BTCUSDT")
+    message["data"]["k"]["x"] = False
+    message["data"]["k"]["c"] = "100.5"
+
+    result = await stream_closed_klines(
+        symbols=["BTCUSDT"],
+        interval="1m",
+        store=store,
+        checkpoints={},
+        message_source=MessageSource([[message]]),
+        open_kline_store=open_store,
+    )
+
+    assert result.klines_saved == 0
+    assert store.saved == []
+    assert open_store.saved[0].symbol == "BTCUSDT"
+    assert open_store.saved[0].close == 100.5
+
+
+@pytest.mark.asyncio
+async def test_stream_closed_klines_checkpoint_uses_normalized_contiguous_last_open_time() -> None:
+    message = closed_message("BTCUSDT")
+    kline = parse_closed_kline_message(message)
+    assert kline is not None
+    store = NormalizingMemoryStore(
+        NormalizeResult(
+            accepted=[kline],
+            rejected=[],
+            conflicts=[],
+            gaps=[],
+            contiguous_last_open_time_ms=kline.open_time_ms - 60_000,
+        )
+    )
+    checkpoints = {}
+
+    await stream_closed_klines(
+        symbols=["BTCUSDT"],
+        interval="1m",
+        store=store,
+        checkpoints=checkpoints,
+        message_source=MessageSource([[message]]),
+    )
+
+    assert checkpoints["BTCUSDT|1m"] == Checkpoint(
+        last_open_time_ms=kline.open_time_ms - 60_000,
+        status="active",
+    )
