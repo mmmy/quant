@@ -118,3 +118,11 @@ class LatestOpenKlineStore:
 
     def _path(self, *, interval: str, symbol: str) -> Path:
         return self.root / f"interval={interval}" / f"symbol={symbol}" / "open_kline.parquet"
+
+
+class InMemoryOpenKlineStore:
+    def __init__(self) -> None:
+        self.latest: dict[tuple[str, str], Kline] = {}
+
+    def upsert_open_kline(self, kline: Kline) -> None:
+        self.latest[(kline.symbol, kline.interval)] = kline

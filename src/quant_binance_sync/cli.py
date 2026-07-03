@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import polars as pl
 import typer
 from rich.progress import (
     BarColumn,
@@ -19,12 +20,20 @@ from rich.progress import (
 )
 
 from quant_binance_sync.archive import BinanceVisionArchiveClient
+from quant_binance_sync.backtest import run_backtest, summarize_equity
 from quant_binance_sync.client import BinanceFuturesClient
 from quant_binance_sync.checkpoints import Checkpoint
 from quant_binance_sync.checkpoints import CheckpointStore, mark_inactive_checkpoints
+from quant_binance_sync.features import build_features
 from quant_binance_sync.normalize_existing import NormalizeExistingProgress, normalize_existing_klines
 from quant_binance_sync.rate_limit import AsyncWeightRateLimiter
-from quant_binance_sync.storage import LatestOpenKlineStore, NormalizedKlineStore, ParquetKlineStore
+from quant_binance_sync.signals import build_signals
+from quant_binance_sync.storage import (
+    InMemoryOpenKlineStore,
+    LatestOpenKlineStore,
+    NormalizedKlineStore,
+    ParquetKlineStore,
+)
 from quant_binance_sync.stream import StreamResult, StreamUpdate, stream_closed_klines
 from quant_binance_sync.symbols import SymbolMetadataStore, refresh_symbol_metadata
 from quant_binance_sync.sync import (
@@ -45,6 +54,25 @@ class StreamProgressEvent:
     requests: int
     connections: int = 0
     symbols: int | None = None
+
+
+def load_interval_checkpoint_store(
+    state_dir: Path,
+    *,
+    interval: str,
+) -> tuple[CheckpointStore, dict[str, Checkpoint]]:
+    store = CheckpointStore(state_dir / f"usdm_kline_checkpoints_{interval}.json")
+    checkpoints = store.load()
+    if checkpoints:
+        return store, checkpoints
+
+    legacy_checkpoints = CheckpointStore(state_dir / "usdm_kline_checkpoints.json").load()
+    suffix = f"|{interval}"
+    return store, {
+        key: checkpoint
+        for key, checkpoint in legacy_checkpoints.items()
+        if key.endswith(suffix)
+    }
 
 
 @app.command("refresh-symbols")
@@ -222,6 +250,98 @@ def normalize_klines(
     )
 
 
+@app.command("build-features")
+def build_features_command(
+    silver_dir: Path = typer.Option(Path("data/silver/binance/usdm_futures/klines")),
+    output_dir: Path = typer.Option(Path("data/gold/binance/usdm_futures/features")),
+    base_interval: str = typer.Option("1m", help="Source kline interval."),
+    feature_interval: str = typer.Option("1h", help="Feature bar interval."),
+    symbol: list[str] | None = typer.Option(None, help="Optional symbol filter, repeatable."),
+) -> None:
+    result = build_features(
+        silver_dir=silver_dir,
+        output_dir=output_dir,
+        base_interval=base_interval,
+        feature_interval=feature_interval,
+        symbol=symbol,
+    )
+    typer.echo(f"rows_written={result.rows_written} files_written={result.files_written}")
+
+
+@app.command("build-signals")
+def build_signals_command(
+    features_dir: Path = typer.Option(Path("data/gold/binance/usdm_futures/features")),
+    output_dir: Path = typer.Option(Path("data/gold/binance/usdm_futures/signals")),
+    feature_interval: str = typer.Option("1h", help="Feature bar interval."),
+    top_n: int = typer.Option(10, min=1, help="Number of symbols to select per rebalance time."),
+) -> None:
+    result = build_signals(
+        features_dir=features_dir,
+        output_dir=output_dir,
+        feature_interval=feature_interval,
+        top_n=top_n,
+    )
+    typer.echo(f"rows_written={result.rows_written} files_written={result.files_written}")
+
+
+@app.command("backtest-signals")
+def backtest_signals_command(
+    signals_path: Path = typer.Option(
+        Path("data/gold/binance/usdm_futures/signals/interval=1h/signals.parquet")
+    ),
+    features_dir: Path = typer.Option(Path("data/gold/binance/usdm_futures/features")),
+    output_path: Path = typer.Option(
+        Path("data/gold/binance/usdm_futures/backtests/interval=1h/equity.parquet")
+    ),
+    feature_interval: str = typer.Option("1h", help="Feature bar interval."),
+    fee_rate: float = typer.Option(0.0, min=0.0, help="One-way fee rate, e.g. 0.0004."),
+    slippage_rate: float = typer.Option(0.0, min=0.0, help="One-way slippage rate."),
+) -> None:
+    result = run_backtest(
+        signals_path=signals_path,
+        features_dir=features_dir,
+        output_path=output_path,
+        feature_interval=feature_interval,
+        fee_rate=fee_rate,
+        slippage_rate=slippage_rate,
+    )
+    typer.echo(f"rows_written={result.rows_written} final_equity={result.final_equity}")
+
+
+@app.command("show-signals")
+def show_signals_command(
+    signals_path: Path = typer.Option(
+        Path("data/gold/binance/usdm_futures/signals/interval=1h/signals.parquet")
+    ),
+    latest: bool = typer.Option(True, "--latest/--all", help="Show only the latest rebalance time."),
+    limit: int = typer.Option(20, min=1, help="Maximum rows to print."),
+) -> None:
+    if not signals_path.exists():
+        typer.echo(f"missing_signals={signals_path}")
+        return
+    frame = pl.read_parquet(signals_path)
+    if latest and not frame.is_empty():
+        latest_time = frame.select(pl.col("feature_available_time_ms").max()).item()
+        frame = frame.filter(pl.col("feature_available_time_ms") == latest_time)
+    view = frame.sort(["feature_available_time_ms", "rank"]).head(limit)
+    typer.echo(view)
+
+
+@app.command("backtest-report")
+def backtest_report_command(
+    equity_path: Path = typer.Option(
+        Path("data/gold/binance/usdm_futures/backtests/interval=1h/equity.parquet")
+    ),
+    periods_per_year: int = typer.Option(365 * 24, min=1),
+) -> None:
+    if not equity_path.exists():
+        typer.echo(f"missing_equity={equity_path}")
+        return
+    report = summarize_equity(pl.read_parquet(equity_path), periods_per_year=periods_per_year)
+    for key, value in report.items():
+        typer.echo(f"{key}={value}")
+
+
 def normalize_progress_bar() -> Progress:
     return Progress(
         SpinnerColumn(),
@@ -277,7 +397,10 @@ def stream_klines(
     silver_dir: Path = typer.Option(Path("data/silver/binance/usdm_futures/klines")),
     quarantine_dir: Path = typer.Option(Path("data/quarantine/binance/usdm_futures/klines")),
     gap_report_path: Path = typer.Option(Path("data/reports/binance/usdm_futures/kline_gaps.parquet")),
-    realtime_dir: Path = typer.Option(Path("data/realtime/binance/usdm_futures/open_klines")),
+    realtime_dir: Path | None = typer.Option(
+        None,
+        help="Optional directory for persisting unclosed latest-candle snapshots.",
+    ),
     meta_dir: Path = typer.Option(Path("data/meta/binance"), help="Symbol metadata directory."),
     state_dir: Path = typer.Option(Path("data/state/binance"), help="Checkpoint state directory."),
     symbol: list[str] | None = typer.Option(None, help="Optional symbol filter, repeatable."),
@@ -371,8 +494,7 @@ async def _sync_klines(
     active_symbols = [symbol.symbol for symbol in metadata_store.load_current_symbols()]
     selected_symbols = symbols or active_symbols
 
-    checkpoint_store = CheckpointStore(state_dir / "usdm_kline_checkpoints.json")
-    checkpoints = checkpoint_store.load()
+    checkpoint_store, checkpoints = load_interval_checkpoint_store(state_dir, interval=interval)
     mark_inactive_checkpoints(checkpoints, active_symbols=active_symbols, interval=interval)
 
     kline_store = make_normalized_kline_store(
@@ -450,8 +572,7 @@ async def _sync_all(
         active = await refresh_symbol_metadata(client=client, store=metadata_store)
         active_symbols = [symbol.symbol for symbol in active]
 
-        checkpoint_store = CheckpointStore(state_dir / "usdm_kline_checkpoints.json")
-        checkpoints = checkpoint_store.load()
+        checkpoint_store, checkpoints = load_interval_checkpoint_store(state_dir, interval=interval)
         mark_inactive_checkpoints(checkpoints, active_symbols=active_symbols, interval=interval)
 
         plan = estimate_sync_plan(
@@ -537,8 +658,7 @@ async def _stream_klines(
             )
         )
 
-    checkpoint_store = CheckpointStore(state_dir / "usdm_kline_checkpoints.json")
-    checkpoints = checkpoint_store.load()
+    checkpoint_store, checkpoints = load_interval_checkpoint_store(state_dir, interval=interval)
     mark_inactive_checkpoints(checkpoints, active_symbols=active_symbols, interval=interval)
     checkpoint_store.save(checkpoints)
 
@@ -552,7 +672,7 @@ async def _stream_klines(
     open_kline_store = (
         LatestOpenKlineStore(realtime_dir)
         if realtime_dir is not None
-        else None
+        else InMemoryOpenKlineStore()
     )
     rate_limiter = AsyncWeightRateLimiter(max_weight_per_minute=max_weight_per_minute)
 

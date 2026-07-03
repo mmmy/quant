@@ -58,12 +58,12 @@ uv run quant-binance-sync stream-klines --interval 1m
 ```
 
 `stream-klines` subscribes to Binance USD-M combined kline streams for the active USDT perpetual
-symbols. Unclosed websocket candles update a realtime latest-candle cache only. Closed candles are
-written to raw Parquet and upserted to the silver Parquet layout, then checkpoints are updated. By
-default it opens websocket streams first, then runs startup REST gap-fill in the background with the
-same request weight limiter used by `sync-klines`. This avoids missing candles that close while a
-large startup gap-fill is still running. After each websocket disconnect, it also uses REST gap-fill
-before reconnecting.
+symbols. Unclosed websocket candles are kept in process only and are not written to disk by default.
+Closed candles are written to raw Parquet and upserted to the silver Parquet layout, then checkpoints
+are updated. By default it opens websocket streams first, then runs startup REST gap-fill in the
+background with the same request weight limiter used by `sync-klines`. This avoids missing candles
+that close while a large startup gap-fill is still running. After each websocket disconnect, it also
+uses REST gap-fill before reconnecting.
 
 For a smoke test that exits after the first disconnect:
 
@@ -89,7 +89,8 @@ data/meta/binance/usdm_symbols_current.json
 Kline checkpoints:
 
 ```text
-data/state/binance/usdm_kline_checkpoints.json
+data/state/binance/usdm_kline_checkpoints_1m.json
+data/state/binance/usdm_kline_checkpoints_15m.json
 ```
 
 Kline Parquet data:
@@ -97,7 +98,6 @@ Kline Parquet data:
 ```text
 data/raw/binance/usdm_futures/klines/interval=1m/symbol=BTCUSDT/date=YYYY-MM-DD/klines.parquet
 data/silver/binance/usdm_futures/klines/interval=1m/symbol=BTCUSDT/date=YYYY-MM-DD/klines.parquet
-data/realtime/binance/usdm_futures/open_klines/interval=1m/symbol=BTCUSDT/open_kline.parquet
 ```
 
 ## First sync size
@@ -166,4 +166,76 @@ startup and reconnect gap-fill work. Disable the live stats for logs or schedule
 
 ```powershell
 uv run quant-binance-sync stream-klines --interval 1m --no-progress
+```
+
+## Feature engine
+
+Build hourly cross-sectional features from normalized silver `1m` klines:
+
+```powershell
+uv run quant-binance-sync build-features --base-interval 1m --feature-interval 1h
+```
+
+Write a filtered feature set for selected symbols:
+
+```powershell
+uv run quant-binance-sync build-features --symbol BTCUSDT --symbol ETHUSDT
+```
+
+The feature engine reads:
+
+```text
+data/silver/binance/usdm_futures/klines/interval=1m/symbol=BTCUSDT/date=YYYY-MM-DD/klines.parquet
+```
+
+and writes:
+
+```text
+data/gold/binance/usdm_futures/features/interval=1h/date=YYYY-MM-DD/features.parquet
+```
+
+Each feature row uses `ts_ms` as the feature bar open time and
+`feature_available_time_ms = ts_ms + feature_interval_ms`, so downstream backtests can avoid
+lookahead. Incomplete feature bars are kept with `is_tradable=false` and no score.
+
+Build Top N equal-weight selection signals from those features:
+
+```powershell
+uv run quant-binance-sync build-signals --feature-interval 1h --top-n 10
+```
+
+Inspect the latest signal basket:
+
+```powershell
+uv run quant-binance-sync show-signals
+```
+
+This writes:
+
+```text
+data/gold/binance/usdm_futures/signals/interval=1h/signals.parquet
+```
+
+Run a simple next-bar equal-weight backtest:
+
+```powershell
+uv run quant-binance-sync backtest-signals --feature-interval 1h
+```
+
+Include one-way fee and slippage assumptions:
+
+```powershell
+uv run quant-binance-sync backtest-signals --feature-interval 1h --fee-rate 0.0004 --slippage-rate 0.0002
+```
+
+This writes an equity curve:
+
+```text
+data/gold/binance/usdm_futures/backtests/interval=1h/equity.parquet
+```
+
+Print the backtest summary:
+
+```powershell
+uv run quant-binance-sync backtest-report
 ```

@@ -4,14 +4,53 @@ import pytest
 from typer.testing import CliRunner
 
 from quant_binance_sync import cli
+from quant_binance_sync.backtest import BacktestResult
 from quant_binance_sync.checkpoints import Checkpoint
+from quant_binance_sync.features import FeatureBuildResult
 from quant_binance_sync.normalize_existing import NormalizeExistingProgress, NormalizeExistingResult
+from quant_binance_sync.signals import SignalBuildResult
 from quant_binance_sync.storage import NormalizedKlineStore
 from quant_binance_sync.stream import StreamResult, StreamUpdate
 from quant_binance_sync.sync import SyncResult
 
 
 runner = CliRunner()
+
+
+def test_stream_klines_cli_does_not_enable_realtime_disk_cache_by_default(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    async def fake_stream_klines(**kwargs):
+        calls.append(kwargs)
+        return StreamResult(connections_seen=1, klines_saved=0)
+
+    monkeypatch.setattr(cli, "_stream_klines", fake_stream_klines)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "stream-klines",
+            "--interval",
+            "15m",
+            "--data-dir",
+            str(tmp_path / "raw"),
+            "--silver-dir",
+            str(tmp_path / "silver"),
+            "--quarantine-dir",
+            str(tmp_path / "quarantine"),
+            "--gap-report-path",
+            str(tmp_path / "gaps.parquet"),
+            "--meta-dir",
+            str(tmp_path / "meta"),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--no-progress",
+            "--once",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["realtime_dir"] is None
 
 
 @pytest.mark.asyncio
@@ -91,7 +130,7 @@ async def test_stream_klines_loads_symbols_and_wires_gap_sync(tmp_path, monkeypa
     await gap_sync(["BTCUSDT"])
 
     checkpoint_payload = json.loads(
-        (state_dir / "usdm_kline_checkpoints.json").read_text(encoding="utf-8")
+        (state_dir / "usdm_kline_checkpoints_1m.json").read_text(encoding="utf-8")
     )
     assert checkpoint_payload["BTCUSDT|1m"]["last_open_time_ms"] == 1719792000000
     assert stream_calls[2]["gap_symbols"] == ["BTCUSDT"]
@@ -127,7 +166,7 @@ async def test_startup_gap_fill_uses_checkpoint_snapshot_after_websocket_starts(
         ),
         encoding="utf-8",
     )
-    (state_dir / "usdm_kline_checkpoints.json").write_text(
+    (state_dir / "usdm_kline_checkpoints_1m.json").write_text(
         json.dumps({"BTCUSDT|1m": {"last_open_time_ms": 1000, "status": "active"}}),
         encoding="utf-8",
     )
@@ -365,6 +404,164 @@ def test_normalize_klines_help_renders() -> None:
 
     assert result.exit_code == 0
     assert "normalize-klines" in result.output
+
+
+def test_build_features_command_wires_feature_builder(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def fake_build_features(**kwargs):
+        calls.append(kwargs)
+        return FeatureBuildResult(rows_written=12, files_written=2)
+
+    monkeypatch.setattr(cli, "build_features", fake_build_features)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "build-features",
+            "--silver-dir",
+            str(tmp_path / "silver"),
+            "--output-dir",
+            str(tmp_path / "gold"),
+            "--base-interval",
+            "1m",
+            "--feature-interval",
+            "1h",
+            "--symbol",
+            "BTCUSDT",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "rows_written=12 files_written=2" in result.output
+    assert calls == [
+        {
+            "silver_dir": tmp_path / "silver",
+            "output_dir": tmp_path / "gold",
+            "base_interval": "1m",
+            "feature_interval": "1h",
+            "symbol": ["BTCUSDT"],
+        }
+    ]
+
+
+def test_build_signals_command_wires_signal_builder(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def fake_build_signals(**kwargs):
+        calls.append(kwargs)
+        return SignalBuildResult(rows_written=20, files_written=1)
+
+    monkeypatch.setattr(cli, "build_signals", fake_build_signals)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "build-signals",
+            "--features-dir",
+            str(tmp_path / "features"),
+            "--output-dir",
+            str(tmp_path / "signals"),
+            "--feature-interval",
+            "1h",
+            "--top-n",
+            "5",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "rows_written=20 files_written=1" in result.output
+    assert calls == [
+        {
+            "features_dir": tmp_path / "features",
+            "output_dir": tmp_path / "signals",
+            "feature_interval": "1h",
+            "top_n": 5,
+        }
+    ]
+
+
+def test_backtest_signals_command_wires_backtest_runner(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def fake_run_backtest(**kwargs):
+        calls.append(kwargs)
+        return BacktestResult(rows_written=3, final_equity=1.23)
+
+    monkeypatch.setattr(cli, "run_backtest", fake_run_backtest)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "backtest-signals",
+            "--signals-path",
+            str(tmp_path / "signals.parquet"),
+            "--features-dir",
+            str(tmp_path / "features"),
+            "--output-path",
+            str(tmp_path / "equity.parquet"),
+            "--feature-interval",
+            "1h",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "rows_written=3 final_equity=1.23" in result.output
+    assert calls == [
+        {
+            "signals_path": tmp_path / "signals.parquet",
+            "features_dir": tmp_path / "features",
+            "output_path": tmp_path / "equity.parquet",
+            "feature_interval": "1h",
+            "fee_rate": 0.0,
+            "slippage_rate": 0.0,
+        }
+    ]
+
+
+def test_show_signals_command_prints_latest_ranked_signals(tmp_path) -> None:
+    import polars as pl
+
+    signals_path = tmp_path / "signals.parquet"
+    pl.DataFrame(
+        {
+            "feature_available_time_ms": [2000, 2000, 3000],
+            "symbol": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+            "score": [0.9, 0.8, 0.7],
+            "rank": [1, 2, 1],
+            "target_weight": [0.5, 0.5, 1.0],
+        }
+    ).write_parquet(signals_path)
+
+    result = runner.invoke(cli.app, ["show-signals", "--signals-path", str(signals_path)])
+
+    assert result.exit_code == 0
+    assert "SOLUSDT" in result.output
+    assert "BTCUSDT" not in result.output
+
+
+def test_backtest_report_command_prints_summary(tmp_path, monkeypatch) -> None:
+    import polars as pl
+
+    equity_path = tmp_path / "equity.parquet"
+    pl.DataFrame(
+        {
+            "time_ms": [1000, 2000],
+            "period_return": [0.0, 0.1],
+            "turnover": [0.0, 1.0],
+            "equity": [1.0, 1.1],
+        }
+    ).write_parquet(equity_path)
+
+    result = runner.invoke(
+        cli.app,
+        ["backtest-report", "--equity-path", str(equity_path), "--periods-per-year", "24"],
+    )
+
+    assert result.exit_code == 0
+    assert "final_equity=1.1" in result.output
+    assert "total_return=" in result.output
+    assert "max_drawdown=" in result.output
 
 
 def test_normalize_progress_callback_updates_total_completed_and_counts() -> None:
