@@ -48,6 +48,34 @@ Sync selected symbols only:
 uv run quant-binance-sync sync-klines --symbol BTCUSDT --symbol ETHUSDT --interval 1m
 ```
 
+## Realtime stream
+
+Run the websocket kline streamer after `refresh-symbols` or `sync-all` has created the current
+symbol universe:
+
+```powershell
+uv run quant-binance-sync stream-klines --interval 1m
+```
+
+`stream-klines` subscribes to Binance USD-M combined kline streams for the active USDT perpetual
+symbols, writes only closed candles to the same partitioned Parquet layout, and updates
+checkpoints. By default it opens websocket streams first, then runs startup REST gap-fill in the
+background with the same request weight limiter used by `sync-klines`. This avoids missing candles
+that close while a large startup gap-fill is still running. After each websocket disconnect, it also
+uses REST gap-fill before reconnecting.
+
+For a smoke test that exits after the first disconnect:
+
+```powershell
+uv run quant-binance-sync stream-klines --interval 1m --symbol BTCUSDT --once
+```
+
+Skip the startup REST gap-fill when you only want websocket data:
+
+```powershell
+uv run quant-binance-sync stream-klines --interval 1m --no-startup-gap-fill
+```
+
 ## Files
 
 Symbol metadata:
@@ -122,4 +150,17 @@ Disable it for logs or schedulers:
 
 ```powershell
 uv run quant-binance-sync sync-klines --interval 1m --no-progress
+```
+
+`stream-klines` also shows compact live stats by default:
+
+```text
+stream klines symbols=520 conns=3 ws=12480 rest=320 requests=42 current=BTCUSDT
+```
+
+`ws` is the number of closed klines saved from websocket streams. `rest` and `requests` track
+startup and reconnect gap-fill work. Disable the live stats for logs or schedulers:
+
+```powershell
+uv run quant-binance-sync stream-klines --interval 1m --no-progress
 ```
