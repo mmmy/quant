@@ -4,7 +4,7 @@ import polars as pl
 
 from quant_binance_sync.features import build_feature_frame, build_features
 from quant_binance_sync.models import Kline
-from quant_binance_sync.storage import ParquetKlineStore
+from quant_binance_sync.storage import ParquetKlineStore, SqliteKlineHotStore
 
 
 def make_minute_rows(symbol: str, start: datetime, closes: list[float]) -> list[dict]:
@@ -123,3 +123,56 @@ def test_build_features_reads_silver_partitions_and_writes_gold_features(tmp_pat
     written = pl.read_parquet(output_path)
     assert result.rows_written == 1
     assert written.item(0, "symbol") == "BTCUSDT"
+
+
+def test_build_features_overlays_realtime_closed_klines(tmp_path) -> None:
+    silver_dir = tmp_path / "silver"
+    gold_dir = tmp_path / "gold"
+    realtime_path = tmp_path / "stream_closed.sqlite"
+    store = ParquetKlineStore(silver_dir)
+    hot_store = SqliteKlineHotStore(realtime_path)
+    start = datetime(2024, 7, 1, 0, 0, tzinfo=UTC)
+    historical = [
+        Kline(
+            symbol=row["symbol"],
+            interval=row["interval"],
+            open_time=row["open_time"],
+            open_time_ms=row["open_time_ms"],
+            open=row["open"],
+            high=row["high"],
+            low=row["low"],
+            close=row["close"],
+            volume=row["volume"],
+            close_time_ms=row["close_time_ms"],
+            quote_volume=row["quote_volume"],
+            trade_count=row["trade_count"],
+            taker_buy_base_volume=row["taker_buy_base_volume"],
+            taker_buy_quote_volume=row["taker_buy_quote_volume"],
+        )
+        for row in make_minute_rows("BTCUSDT", start, [100.0] * 59)
+    ]
+    latest = Kline(
+        **{
+            **historical[-1].__dict__,
+            "open_time": start + timedelta(minutes=59),
+            "open_time_ms": int((start + timedelta(minutes=59)).timestamp() * 1000),
+            "close": 110.0,
+            "close_time_ms": int((start + timedelta(minutes=60)).timestamp() * 1000) - 1,
+        }
+    )
+    store.upsert_klines(historical)
+    hot_store.upsert_klines([latest])
+
+    result = build_features(
+        silver_dir=silver_dir,
+        output_dir=gold_dir,
+        base_interval="1m",
+        feature_interval="1h",
+        realtime_closed_db_path=realtime_path,
+    )
+
+    output_path = gold_dir / "interval=1h" / "date=2024-07-01" / "features.parquet"
+    written = pl.read_parquet(output_path)
+    assert result.rows_written == 1
+    assert written.item(0, "minute_count") == 60
+    assert written.item(0, "close") == 110.0

@@ -1,4 +1,6 @@
+import asyncio
 import json
+from datetime import UTC, datetime
 
 import pytest
 from typer.testing import CliRunner
@@ -11,6 +13,7 @@ from quant_binance_sync.normalize_existing import NormalizeExistingProgress, Nor
 from quant_binance_sync.relative_strength import RelativeStrengthBuildResult
 from quant_binance_sync.signals import SignalBuildResult
 from quant_binance_sync.storage import NormalizedKlineStore
+from quant_binance_sync.models import Kline
 from quant_binance_sync.stream import StreamResult, StreamUpdate
 from quant_binance_sync.sync import SyncResult
 
@@ -45,6 +48,10 @@ def test_stream_klines_cli_does_not_enable_realtime_disk_cache_by_default(tmp_pa
             str(tmp_path / "meta"),
             "--state-dir",
             str(tmp_path / "state"),
+            "--hot-flush-size",
+            "100",
+            "--hot-flush-interval-seconds",
+            "0.5",
             "--no-progress",
             "--once",
         ],
@@ -52,6 +59,10 @@ def test_stream_klines_cli_does_not_enable_realtime_disk_cache_by_default(tmp_pa
 
     assert result.exit_code == 0
     assert calls[0]["realtime_dir"] is None
+    assert calls[0]["realtime_closed_db_path"] == tmp_path / "state" / "stream_closed_klines_15m.sqlite"
+    assert calls[0]["shutdown_callback"] is not None
+    assert calls[0]["hot_flush_size"] == 100
+    assert calls[0]["hot_flush_interval_seconds"] == 0.5
 
 
 @pytest.mark.asyncio
@@ -126,6 +137,7 @@ async def test_stream_klines_loads_symbols_and_wires_gap_sync(tmp_path, monkeypa
     assert result == StreamResult(connections_seen=1, klines_saved=2)
     assert stream_calls[0]["symbols"] == ["BTCUSDT"]
     assert stream_calls[0]["open_kline_store"] is not None
+    assert hasattr(stream_calls[0]["store"], "flush")
     assert stream_calls[1]["gap_symbols"] == ["BTCUSDT"]
 
     await gap_sync(["BTCUSDT"])
@@ -225,6 +237,85 @@ async def test_startup_gap_fill_uses_checkpoint_snapshot_after_websocket_starts(
             "gap_checkpoint": Checkpoint(last_open_time_ms=1000, status="active"),
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_stream_klines_cancels_startup_gap_fill_on_shutdown(tmp_path, monkeypatch) -> None:
+    meta_dir = tmp_path / "meta"
+    state_dir = tmp_path / "state"
+    data_dir = tmp_path / "raw"
+    silver_dir = tmp_path / "silver"
+    meta_dir.mkdir()
+    (meta_dir / "usdm_symbols_current.json").write_text(
+        json.dumps(
+            {
+                "snapshot_time": "2024-07-01T00:00:00+00:00",
+                "symbols": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "base_asset": "BTC",
+                        "quote_asset": "USDT",
+                        "contract_type": "PERPETUAL",
+                        "status": "TRADING",
+                        "onboard_date": 1,
+                        "delivery_date": 2,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    startup_cancelled = asyncio.Event()
+    startup_started = asyncio.Event()
+    shutdown_messages = []
+
+    async def fake_stream_closed_klines(**kwargs):
+        await startup_started.wait()
+        raise asyncio.CancelledError
+
+    async def fake_sync_missing_klines(**kwargs):
+        startup_started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            startup_cancelled.set()
+            raise
+
+    class NullClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(cli, "stream_closed_klines", fake_stream_closed_klines)
+    monkeypatch.setattr(cli, "sync_missing_klines", fake_sync_missing_klines)
+    monkeypatch.setattr(cli, "BinanceFuturesClient", NullClient)
+
+    with pytest.raises(asyncio.CancelledError):
+        await cli._stream_klines(
+            interval="1m",
+            data_dir=data_dir,
+            silver_dir=silver_dir,
+            meta_dir=meta_dir,
+            state_dir=state_dir,
+            symbol=None,
+            streams_per_connection=200,
+            max_weight_per_minute=900,
+            reconnect_delay_seconds=0,
+            once=False,
+            shutdown_callback=shutdown_messages.append,
+        )
+
+    assert startup_cancelled.is_set()
+    assert shutdown_messages[0].startswith("shutdown=requested")
+    assert "sql_buffer=" in shutdown_messages[0]
+    assert "pending=" in shutdown_messages[0]
+    assert shutdown_messages[-1].startswith("shutdown=complete")
+    assert "checkpoints_saved=1" in shutdown_messages[-1]
 
 
 @pytest.mark.asyncio
@@ -470,6 +561,8 @@ def test_build_features_command_wires_feature_builder(tmp_path, monkeypatch) -> 
             "1m",
             "--feature-interval",
             "1h",
+            "--realtime-closed-db-path",
+            str(tmp_path / "state" / "stream_closed_klines_1m.sqlite"),
             "--symbol",
             "BTCUSDT",
         ],
@@ -483,6 +576,7 @@ def test_build_features_command_wires_feature_builder(tmp_path, monkeypatch) -> 
             "output_dir": tmp_path / "gold",
             "base_interval": "1m",
             "feature_interval": "1h",
+            "realtime_closed_db_path": tmp_path / "state" / "stream_closed_klines_1m.sqlite",
             "symbol": ["BTCUSDT"],
         }
     ]
@@ -640,6 +734,8 @@ def test_build_relative_strength_command_wires_builder(tmp_path, monkeypatch) ->
             "100",
             "--liquidity-lookback-bars",
             "20",
+            "--realtime-closed-db-path",
+            str(tmp_path / "state" / "stream_closed_klines_15m.sqlite"),
         ],
     )
 
@@ -657,6 +753,7 @@ def test_build_relative_strength_command_wires_builder(tmp_path, monkeypatch) ->
             "warmup_bars": 50,
             "liquidity_top_n": 100,
             "liquidity_lookback_bars": 20,
+            "realtime_closed_db_path": tmp_path / "state" / "stream_closed_klines_15m.sqlite",
         }
     ]
 
@@ -680,6 +777,8 @@ def test_build_relative_strength_presets_command_runs_each_preset_tf(tmp_path, m
             str(tmp_path / "silver"),
             "--output-dir",
             str(tmp_path / "rs"),
+            "--state-dir",
+            str(tmp_path / "state"),
             "--btc-symbol",
             "BTCUSDT",
         ],
@@ -700,7 +799,9 @@ def test_build_relative_strength_presets_command_runs_each_preset_tf(tmp_path, m
         "warmup_bars": 80,
         "liquidity_top_n": 100,
         "liquidity_lookback_bars": 240,
+        "realtime_closed_db_path": tmp_path / "state" / "stream_closed_klines_1m.sqlite",
     }
+    assert calls[-1]["realtime_closed_db_path"] == tmp_path / "state" / "stream_closed_klines_15m.sqlite"
 
 
 def test_build_relative_strength_presets_command_uses_config_file(tmp_path, monkeypatch) -> None:
@@ -740,6 +841,8 @@ max_ret = 0.07
             str(tmp_path / "silver"),
             "--output-dir",
             str(tmp_path / "rs"),
+            "--realtime-closed-db-path",
+            str(tmp_path / "custom.sqlite"),
         ],
     )
 
@@ -751,6 +854,7 @@ max_ret = 0.07
     assert calls[0]["liquidity_lookback_bars"] == 21
     assert calls[0]["max_abs_gap_atr"] == 1.6
     assert calls[0]["max_ret"] == 0.07
+    assert calls[0]["realtime_closed_db_path"] == tmp_path / "custom.sqlite"
 
 
 def test_build_relative_strength_presets_command_can_build_single_configured_tf(
@@ -1117,6 +1221,23 @@ async def test_stream_klines_wires_progress_callbacks(tmp_path, monkeypatch) -> 
     progress_events = []
 
     async def fake_stream_closed_klines(**kwargs):
+        kline = Kline(
+            symbol="BTCUSDT",
+            interval="1m",
+            open_time=datetime(2024, 7, 1, 0, 0, tzinfo=UTC),
+            open_time_ms=1719792000000,
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.5,
+            volume=10.0,
+            close_time_ms=1719792059999,
+            quote_volume=1000.0,
+            trade_count=5,
+            taker_buy_base_volume=4.0,
+            taker_buy_quote_volume=400.0,
+        )
+        kwargs["store"].upsert_klines([kline])
         kwargs["progress_callback"](
             StreamUpdate(symbol="BTCUSDT", open_time_ms=1719792000000, kline_saved=True)
         )
@@ -1171,6 +1292,72 @@ async def test_stream_klines_wires_progress_callbacks(tmp_path, monkeypatch) -> 
             requests=0,
             connections=1,
         ),
+        cli.StreamProgressEvent(
+            kind="hot_store",
+            symbol="-",
+            klines=0,
+            requests=0,
+            sql_buffer_klines=1,
+            sqlite_flushes=0,
+            pending_klines=0,
+            parquet_flushes=0,
+            flush_size=1000,
+        ),
         cli.StreamProgressEvent(kind="ws_kline", symbol="BTCUSDT", klines=1, requests=0),
         cli.StreamProgressEvent(kind="rest_batch", symbol="BTCUSDT", klines=3, requests=1),
+        cli.StreamProgressEvent(
+            kind="hot_store",
+            symbol="-",
+            klines=0,
+            requests=0,
+            sql_buffer_klines=0,
+            sqlite_flushes=1,
+            pending_klines=1,
+            parquet_flushes=0,
+            flush_size=1000,
+        ),
+        cli.StreamProgressEvent(
+            kind="hot_store",
+            symbol="-",
+            klines=0,
+            requests=0,
+            sql_buffer_klines=0,
+            sqlite_flushes=1,
+            pending_klines=0,
+            parquet_flushes=1,
+            flush_size=1000,
+        ),
     ]
+
+
+def test_stream_progress_callback_tracks_hot_store_stats() -> None:
+    updates = []
+
+    class FakeProgress:
+        def add_task(self, *args, **kwargs):
+            return 1
+
+        def update(self, task_id, **kwargs):
+            updates.append(kwargs)
+
+    callback = cli.make_stream_progress_callback(FakeProgress(), symbol_count=530)
+
+    callback(
+        cli.StreamProgressEvent(
+            kind="hot_store",
+            symbol="-",
+            klines=0,
+            requests=0,
+            sql_buffer_klines=30,
+            sqlite_flushes=26,
+            pending_klines=2650,
+            parquet_flushes=0,
+            flush_size=5000,
+        )
+    )
+
+    assert updates[-1]["sql_buffer_klines"] == 30
+    assert updates[-1]["sqlite_flushes"] == 26
+    assert updates[-1]["pending_klines"] == 2650
+    assert updates[-1]["parquet_flushes"] == 0
+    assert updates[-1]["flush_size"] == 5000

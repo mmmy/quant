@@ -5,6 +5,7 @@ from pathlib import Path
 
 import polars as pl
 
+from quant_binance_sync.features import overlay_realtime_closed_klines
 from quant_binance_sync.sync import interval_to_milliseconds
 
 
@@ -60,6 +61,7 @@ def build_relative_strength(
     warmup_bars: int = 50,
     liquidity_top_n: int | None = None,
     liquidity_lookback_bars: int = 20,
+    realtime_closed_db_path: Path | str | None = None,
 ) -> RelativeStrengthBuildResult:
     source_interval = relative_strength_source_interval(tf)
     files = sorted(
@@ -69,6 +71,13 @@ def build_relative_strength(
         return RelativeStrengthBuildResult(rows_written=0, files_written=0)
 
     frame = pl.concat((pl.read_parquet(path) for path in files), how="vertical_relaxed")
+    if realtime_closed_db_path is not None:
+        frame = overlay_realtime_closed_klines(
+            frame,
+            realtime_closed_db_path=Path(realtime_closed_db_path),
+            base_interval=source_interval,
+            symbol=None,
+        )
     if tail_bars is not None:
         frame = filter_source_tail(
             frame,

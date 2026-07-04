@@ -3,10 +3,11 @@ from datetime import UTC, datetime, timedelta
 import polars as pl
 
 from quant_binance_sync.relative_strength import (
+    build_relative_strength,
     build_relative_strength_frame,
     relative_strength_source_interval,
 )
-from quant_binance_sync.storage import ParquetKlineStore
+from quant_binance_sync.storage import ParquetKlineStore, SqliteKlineHotStore
 from quant_binance_sync.models import Kline
 
 
@@ -208,3 +209,73 @@ def test_build_relative_strength_tail_bars_writes_only_recent_target_bars(tmp_pa
     written = pl.read_parquet(tmp_path / "gold" / "tf=15" / "relative_strength.parquet")
     assert build_result.rows_written == 4
     assert written.select("ts_ms").unique().height == 2
+
+
+def test_build_relative_strength_overlays_realtime_closed_klines(tmp_path) -> None:
+    silver_dir = tmp_path / "silver"
+    realtime_path = tmp_path / "stream_closed_klines_1m.sqlite"
+    store = ParquetKlineStore(silver_dir)
+    hot_store = SqliteKlineHotStore(realtime_path)
+    start = datetime(2024, 7, 1, 0, 0, tzinfo=UTC)
+    historical = []
+    for row in [
+        *make_rows("BTCUSDT", start, [100.0, 101.0]),
+        *make_rows("ETHUSDT", start, [100.0, 102.0]),
+    ]:
+        historical.append(
+            Kline(
+                symbol=row["symbol"],
+                interval=row["interval"],
+                open_time=row["open_time"],
+                open_time_ms=row["open_time_ms"],
+                open=row["open"],
+                high=row["high"],
+                low=row["low"],
+                close=row["close"],
+                volume=row["volume"],
+                close_time_ms=row["close_time_ms"],
+                quote_volume=row["quote_volume"],
+                trade_count=row["trade_count"],
+                taker_buy_base_volume=row["taker_buy_base_volume"],
+                taker_buy_quote_volume=row["taker_buy_quote_volume"],
+            )
+        )
+    latest = []
+    for row in [
+        *make_rows("BTCUSDT", start + timedelta(minutes=2), [102.0]),
+        *make_rows("ETHUSDT", start + timedelta(minutes=2), [108.0]),
+    ]:
+        latest.append(
+            Kline(
+                symbol=row["symbol"],
+                interval=row["interval"],
+                open_time=row["open_time"],
+                open_time_ms=row["open_time_ms"],
+                open=row["open"],
+                high=row["high"],
+                low=row["low"],
+                close=row["close"],
+                volume=row["volume"],
+                close_time_ms=row["close_time_ms"],
+                quote_volume=row["quote_volume"],
+                trade_count=row["trade_count"],
+                taker_buy_base_volume=row["taker_buy_base_volume"],
+                taker_buy_quote_volume=row["taker_buy_quote_volume"],
+            )
+        )
+    store.upsert_klines(historical)
+    hot_store.upsert_klines(latest)
+
+    build_result = build_relative_strength(
+        silver_dir=silver_dir,
+        output_dir=tmp_path / "gold",
+        tf="1",
+        max_abs_gap_atr=100.0,
+        realtime_closed_db_path=realtime_path,
+    )
+
+    written = pl.read_parquet(tmp_path / "gold" / "tf=1" / "relative_strength.parquet")
+    assert build_result.rows_written == 3
+    assert written.select(pl.col("ts_ms").max()).item() == int(
+        (start + timedelta(minutes=2)).timestamp() * 1000
+    )

@@ -62,11 +62,26 @@ uv run quant-binance-sync stream-klines --interval 1m
 
 `stream-klines` subscribes to Binance USD-M combined kline streams for the active USDT perpetual
 symbols. Unclosed websocket candles are kept in process only and are not written to disk by default.
-Closed candles are written to raw Parquet and upserted to the silver Parquet layout, then checkpoints
-are updated. By default it opens websocket streams first, then runs startup REST gap-fill in the
-background with the same request weight limiter used by `sync-klines`. This avoids missing candles
-that close while a large startup gap-fill is still running. After each websocket disconnect, it also
-uses REST gap-fill before reconnecting.
+Closed websocket candles are buffered briefly in memory, batch-upserted to a small SQLite hot store,
+then flushed in larger batches to the raw and silver Parquet layouts. This avoids a SQLite commit
+and Parquet partition rewrite for every single closed candle while keeping the latest streamed data
+available on disk. By default the hot store is:
+
+```text
+data/state/binance/stream_closed_klines_1m.sqlite
+data/state/binance/stream_closed_klines_15m.sqlite
+```
+
+Tune the SQLite and Parquet flush batch sizes:
+
+```powershell
+uv run quant-binance-sync stream-klines --interval 1m --hot-flush-size 100 --hot-flush-interval-seconds 0.5 --stream-flush-size 1000
+```
+
+By default it opens websocket streams first, then runs startup REST gap-fill in the background with
+the same request weight limiter used by `sync-klines`. This avoids missing candles that close while
+a large startup gap-fill is still running. After each websocket disconnect, it also uses REST gap-fill
+before reconnecting.
 
 For a smoke test that exits after the first disconnect:
 
@@ -94,6 +109,13 @@ Kline checkpoints:
 ```text
 data/state/binance/usdm_kline_checkpoints_1m.json
 data/state/binance/usdm_kline_checkpoints_15m.json
+```
+
+Realtime closed-kline hot stores:
+
+```text
+data/state/binance/stream_closed_klines_1m.sqlite
+data/state/binance/stream_closed_klines_15m.sqlite
 ```
 
 Kline Parquet data:
@@ -161,11 +183,14 @@ uv run quant-binance-sync sync-klines --interval 1m --no-progress
 `stream-klines` also shows compact live stats by default:
 
 ```text
-stream klines symbols=520 conns=3 ws=12480 rest=320 requests=42 current=BTCUSDT
+stream klines symbols=520 conns=3 ws=12480 rest=320 requests=42 sqlbuf=30 sqlflush=124 pending=2480 pqflush=2/5000 current=BTCUSDT
 ```
 
-`ws` is the number of closed klines saved from websocket streams. `rest` and `requests` track
-startup and reconnect gap-fill work. Disable the live stats for logs or schedulers:
+`ws` is the number of closed klines received from websocket streams. `sqlbuf` is the in-memory
+buffer waiting for the next SQLite batch write. `sqlflush` counts SQLite batch writes. `pending`
+is the number of SQLite hot-store rows not yet flushed to Parquet. `pqflush` is the Parquet flush
+count and threshold. `rest` and `requests` track startup and reconnect gap-fill work. Disable the
+live stats for logs or schedulers:
 
 ```powershell
 uv run quant-binance-sync stream-klines --interval 1m --no-progress
@@ -177,6 +202,13 @@ Build hourly cross-sectional features from normalized silver `1m` klines:
 
 ```powershell
 uv run quant-binance-sync build-features --base-interval 1m --feature-interval 1h
+```
+
+Include streamed closed candles that are still in the SQLite hot store and have not yet been flushed
+to Parquet:
+
+```powershell
+uv run quant-binance-sync build-features --base-interval 1m --feature-interval 1h --realtime-closed-db-path data/state/binance/stream_closed_klines_1m.sqlite
 ```
 
 Write a filtered feature set for selected symbols:
@@ -251,6 +283,12 @@ Build a single-timeframe BTC-relative strength board:
 uv run quant-binance-sync build-relative-strength --tf 15
 ```
 
+Include streamed closed candles that are still in the SQLite hot store:
+
+```powershell
+uv run quant-binance-sync build-relative-strength --tf 15 --realtime-closed-db-path data/state/binance/stream_closed_klines_15m.sqlite
+```
+
 Build multiple practical boards with tuned defaults:
 
 ```powershell
@@ -258,6 +296,14 @@ uv run quant-binance-sync build-relative-strength-presets --preset scalp
 uv run quant-binance-sync build-relative-strength-presets --preset intraday
 uv run quant-binance-sync build-relative-strength-presets --preset swing
 uv run quant-binance-sync build-relative-strength-presets --preset all
+```
+
+Preset builds automatically choose the hot store by source interval when `--state-dir` is set or left
+at its default:
+
+```text
+1, 2, 3, 4, 5, 8, 10, 20 -> stream_closed_klines_1m.sqlite
+15, 30, 45, 60, 90, 120, 180, 240, 360, 480, 720, D -> stream_closed_klines_15m.sqlite
 ```
 
 Preview the resolved parameters without writing files:

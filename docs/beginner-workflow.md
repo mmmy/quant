@@ -37,6 +37,21 @@ data/silver/binance/usdm_futures/klines/interval=1m/...
 data/silver/binance/usdm_futures/klines/interval=15m/...
 ```
 
+If you also run the realtime streamer, closed websocket candles are buffered briefly in memory,
+batch-upserted to SQLite hot stores, then batch-flushed to Parquet:
+
+```powershell
+uv run quant-binance-sync stream-klines --interval 1m --hot-flush-size 100 --hot-flush-interval-seconds 0.5
+uv run quant-binance-sync stream-klines --interval 15m --hot-flush-size 100 --hot-flush-interval-seconds 0.5
+```
+
+Default hot-store paths:
+
+```text
+data/state/binance/stream_closed_klines_1m.sqlite
+data/state/binance/stream_closed_klines_15m.sqlite
+```
+
 ## 3. Build A Relative Strength Board
 
 Recommended: build a preset group first. Each preset uses practical `tail-bars`, warmup,
@@ -48,6 +63,9 @@ uv run quant-binance-sync build-relative-strength-presets --preset intraday
 uv run quant-binance-sync build-relative-strength-presets --preset swing
 uv run quant-binance-sync build-relative-strength-presets --preset all
 ```
+
+Preset builds automatically overlay the realtime SQLite hot store for each source interval, so a
+running streamer can make the newest closed candles available before the next Parquet batch flush.
 
 Preview the parameters first:
 
@@ -82,6 +100,12 @@ Build a 15-minute BTC-relative strength board:
 
 ```powershell
 uv run quant-binance-sync build-relative-strength --tf 15 --tail-bars 100 --liquidity-top-n 100
+```
+
+To overlay the 15m realtime hot store explicitly:
+
+```powershell
+uv run quant-binance-sync build-relative-strength --tf 15 --tail-bars 100 --liquidity-top-n 100 --realtime-closed-db-path data/state/binance/stream_closed_klines_15m.sqlite
 ```
 
 Build a 1-hour board:
@@ -223,6 +247,13 @@ uv run quant-binance-sync build-signals --feature-interval 1h --top-n 10
 uv run quant-binance-sync show-signals
 uv run quant-binance-sync backtest-signals --feature-interval 1h --fee-rate 0.0004 --slippage-rate 0.0002
 uv run quant-binance-sync backtest-report
+```
+
+When a realtime `1m` stream is running, include closed candles that are still in the SQLite hot
+store:
+
+```powershell
+uv run quant-binance-sync build-features --base-interval 1m --feature-interval 1h --realtime-closed-db-path data/state/binance/stream_closed_klines_1m.sqlite
 ```
 
 Use the BTC-relative strength board first if your main goal is discretionary BTC-timed entries.

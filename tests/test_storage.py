@@ -3,7 +3,12 @@ from datetime import UTC, datetime
 import polars as pl
 
 from quant_binance_sync.models import Kline
-from quant_binance_sync.storage import NormalizedKlineStore, ParquetKlineStore
+from quant_binance_sync.storage import (
+    BufferedKlineStore,
+    NormalizedKlineStore,
+    ParquetKlineStore,
+    SqliteKlineHotStore,
+)
 
 
 def make_kline(symbol: str, close: float) -> Kline:
@@ -111,3 +116,77 @@ def test_normalized_store_writes_gap_report(tmp_path) -> None:
     assert gap_frame.height == 1
     assert gap_frame.item(0, "missing_open_time_ms") == 1719792060000
     assert result.gap_count == 1
+
+
+def test_sqlite_hot_store_upserts_closed_klines_immediately(tmp_path) -> None:
+    store = SqliteKlineHotStore(tmp_path / "realtime.db")
+    first = make_kline("BTCUSDT", 100.0)
+    replacement = make_kline("BTCUSDT", 101.0)
+
+    store.upsert_klines([first])
+    store.upsert_klines([replacement])
+
+    rows = store.load_klines(interval="1m", symbols=["BTCUSDT"])
+    assert rows == [replacement]
+
+
+def test_buffered_store_defers_parquet_until_flush(tmp_path) -> None:
+    stats = []
+    hot = SqliteKlineHotStore(tmp_path / "realtime.db")
+    parquet = ParquetKlineStore(tmp_path / "raw")
+    store = BufferedKlineStore(
+        hot=hot,
+        cold=parquet,
+        flush_size=2,
+        hot_flush_size=100,
+        stats_callback=stats.append,
+    )
+    first = make_kline("BTCUSDT", 100.0)
+
+    store.upsert_klines([first])
+
+    relative_path = "interval=1m/symbol=BTCUSDT/date=2024-07-01/klines.parquet"
+    assert hot.load_klines(interval="1m", symbols=["BTCUSDT"]) == []
+    assert not (tmp_path / "raw" / relative_path).exists()
+    assert stats[-1].sql_buffer_klines == 1
+    assert stats[-1].sqlite_flushes == 0
+    assert stats[-1].pending_klines == 0
+    assert stats[-1].parquet_flushes == 0
+
+    store.flush()
+
+    frame = pl.read_parquet(tmp_path / "raw" / relative_path)
+    assert frame.height == 1
+    assert frame.item(0, "close") == 100.0
+    assert hot.load_klines(interval="1m", symbols=["BTCUSDT"]) == []
+    assert stats[-1].sql_buffer_klines == 0
+    assert stats[-1].sqlite_flushes == 1
+    assert stats[-1].pending_klines == 0
+    assert stats[-1].parquet_flushes == 1
+
+
+def test_buffered_store_flushes_sqlite_when_hot_buffer_reaches_threshold(tmp_path) -> None:
+    stats = []
+    hot = SqliteKlineHotStore(tmp_path / "realtime.db")
+    parquet = ParquetKlineStore(tmp_path / "raw")
+    store = BufferedKlineStore(
+        hot=hot,
+        cold=parquet,
+        flush_size=10,
+        hot_flush_size=2,
+        stats_callback=stats.append,
+    )
+    first = make_kline("BTCUSDT", 100.0)
+    second = make_kline("ETHUSDT", 200.0)
+
+    store.upsert_klines([first])
+    store.upsert_klines([second])
+
+    assert hot.load_klines(interval="1m", symbols=["BTCUSDT", "ETHUSDT"]) == [
+        first,
+        second,
+    ]
+    assert stats[-1].sql_buffer_klines == 0
+    assert stats[-1].sqlite_flushes == 1
+    assert stats[-1].pending_klines == 2
+    assert stats[-1].parquet_flushes == 0

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,17 +28,20 @@ from quant_binance_sync.checkpoints import CheckpointStore, mark_inactive_checkp
 from quant_binance_sync.features import build_features
 from quant_binance_sync.normalize_existing import NormalizeExistingProgress, normalize_existing_klines
 from quant_binance_sync.rate_limit import AsyncWeightRateLimiter
-from quant_binance_sync.relative_strength import build_relative_strength
+from quant_binance_sync.relative_strength import build_relative_strength, relative_strength_source_interval
 from quant_binance_sync.relative_strength_presets import (
     resolve_relative_strength_preset_timeframe,
     resolve_relative_strength_presets,
 )
 from quant_binance_sync.signals import build_signals
 from quant_binance_sync.storage import (
+    BufferedKlineStore,
+    BufferedKlineStoreStats,
     InMemoryOpenKlineStore,
     LatestOpenKlineStore,
     NormalizedKlineStore,
     ParquetKlineStore,
+    SqliteKlineHotStore,
 )
 from quant_binance_sync.stream import StreamResult, StreamUpdate, stream_closed_klines
 from quant_binance_sync.symbols import SymbolMetadataStore, refresh_symbol_metadata
@@ -60,6 +63,11 @@ class StreamProgressEvent:
     requests: int
     connections: int = 0
     symbols: int | None = None
+    sql_buffer_klines: int = 0
+    sqlite_flushes: int = 0
+    pending_klines: int = 0
+    parquet_flushes: int = 0
+    flush_size: int = 0
 
 
 class ThrottledCheckpointCallback:
@@ -297,6 +305,10 @@ def build_features_command(
     output_dir: Path = typer.Option(Path("data/gold/binance/usdm_futures/features")),
     base_interval: str = typer.Option("1m", help="Source kline interval."),
     feature_interval: str = typer.Option("1h", help="Feature bar interval."),
+    realtime_closed_db_path: Path | None = typer.Option(
+        None,
+        help="Optional SQLite closed-kline hot store to overlay before building features.",
+    ),
     symbol: list[str] | None = typer.Option(None, help="Optional symbol filter, repeatable."),
 ) -> None:
     result = build_features(
@@ -304,6 +316,7 @@ def build_features_command(
         output_dir=output_dir,
         base_interval=base_interval,
         feature_interval=feature_interval,
+        realtime_closed_db_path=realtime_closed_db_path,
         symbol=symbol,
     )
     typer.echo(f"rows_written={result.rows_written} files_written={result.files_written}")
@@ -395,6 +408,10 @@ def build_relative_strength_command(
     warmup_bars: int = typer.Option(50, min=0, help="Extra target bars used for EMA/ATR warmup."),
     liquidity_top_n: int | None = typer.Option(None, min=1),
     liquidity_lookback_bars: int = typer.Option(20, min=1),
+    realtime_closed_db_path: Path | None = typer.Option(
+        None,
+        help="Optional SQLite closed-kline hot store to overlay before building relative strength.",
+    ),
 ) -> None:
     result = build_relative_strength(
         silver_dir=silver_dir,
@@ -407,6 +424,7 @@ def build_relative_strength_command(
         warmup_bars=warmup_bars,
         liquidity_top_n=liquidity_top_n,
         liquidity_lookback_bars=liquidity_lookback_bars,
+        realtime_closed_db_path=realtime_closed_db_path,
     )
     typer.echo(f"rows_written={result.rows_written} files_written={result.files_written}")
 
@@ -417,6 +435,11 @@ def build_relative_strength_presets_command(
     tf: str | None = typer.Option(None, help="Build one configured timeframe instead of a group."),
     silver_dir: Path = typer.Option(Path("data/silver/binance/usdm_futures/klines")),
     output_dir: Path = typer.Option(Path("data/gold/binance/usdm_futures/relative_strength")),
+    state_dir: Path = typer.Option(Path("data/state/binance"), help="Checkpoint and hot-store state directory."),
+    realtime_closed_db_path: Path | None = typer.Option(
+        None,
+        help="Optional SQLite closed-kline hot store; defaults per source interval when omitted.",
+    ),
     btc_symbol: str = typer.Option("BTCUSDT"),
     config: Path | None = typer.Option(None, help="Optional TOML preset config file."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print resolved params without writing."),
@@ -450,10 +473,19 @@ def build_relative_strength_presets_command(
             warmup_bars=item.warmup_bars,
             liquidity_top_n=item.liquidity_top_n,
             liquidity_lookback_bars=item.liquidity_lookback_bars,
+            realtime_closed_db_path=(
+                realtime_closed_db_path
+                or relative_strength_realtime_db_path(state_dir=state_dir, tf=item.tf)
+            ),
         )
         typer.echo(
             f"tf={item.tf} rows_written={result.rows_written} files_written={result.files_written}"
         )
+
+
+def relative_strength_realtime_db_path(*, state_dir: Path, tf: str) -> Path:
+    source_interval = relative_strength_source_interval(tf)
+    return state_dir / f"stream_closed_klines_{source_interval}.sqlite"
 
 
 @app.command("show-relative-strength")
@@ -561,6 +593,10 @@ def stream_klines(
         None,
         help="Optional directory for persisting unclosed latest-candle snapshots.",
     ),
+    realtime_closed_db_path: Path | None = typer.Option(
+        None,
+        help="SQLite path for closed streamed klines before Parquet compaction.",
+    ),
     meta_dir: Path = typer.Option(Path("data/meta/binance"), help="Symbol metadata directory."),
     state_dir: Path = typer.Option(Path("data/state/binance"), help="Checkpoint state directory."),
     symbol: list[str] | None = typer.Option(None, help="Optional symbol filter, repeatable."),
@@ -577,6 +613,21 @@ def stream_klines(
     ),
     limit: int = typer.Option(499, min=1, max=1500, help="Candles per REST gap-fill request."),
     concurrency: int = typer.Option(8, min=1, max=50),
+    stream_flush_size: int = typer.Option(
+        1000,
+        min=1,
+        help="Closed websocket klines to batch before flushing to Parquet.",
+    ),
+    hot_flush_size: int = typer.Option(
+        100,
+        min=1,
+        help="Closed websocket klines to batch before flushing to SQLite.",
+    ),
+    hot_flush_interval_seconds: float = typer.Option(
+        0.5,
+        min=0.01,
+        help="Maximum seconds to keep closed websocket klines in memory before SQLite flush.",
+    ),
     max_weight_per_minute: int = typer.Option(900, min=1, help="Binance REST request weight budget."),
     startup_gap_fill: bool = typer.Option(
         True,
@@ -605,6 +656,10 @@ def stream_klines(
                 quarantine_dir=quarantine_dir,
                 gap_report_path=gap_report_path,
                 realtime_dir=realtime_dir,
+                realtime_closed_db_path=(
+                    realtime_closed_db_path
+                    or state_dir / f"stream_closed_klines_{interval}.sqlite"
+                ),
                 meta_dir=meta_dir,
                 state_dir=state_dir,
                 symbol=symbol,
@@ -612,11 +667,15 @@ def stream_klines(
                 bootstrap_days=bootstrap_days,
                 limit=limit,
                 concurrency=concurrency,
+                stream_flush_size=stream_flush_size,
+                hot_flush_size=hot_flush_size,
+                hot_flush_interval_seconds=hot_flush_interval_seconds,
                 max_weight_per_minute=max_weight_per_minute,
                 startup_gap_fill=startup_gap_fill,
                 reconnect_delay_seconds=reconnect_delay_seconds,
                 once=once,
                 progress_callback=callback,
+                shutdown_callback=typer.echo,
             )
         )
     typer.echo(f"connections_seen={result.connections_seen} klines_saved={result.klines_saved}")
@@ -798,6 +857,7 @@ async def _stream_klines(
     quarantine_dir: Path | None = None,
     gap_report_path: Path | None = None,
     realtime_dir: Path | None = None,
+    realtime_closed_db_path: Path | None = None,
     meta_dir: Path,
     state_dir: Path,
     symbol: list[str] | None,
@@ -809,7 +869,11 @@ async def _stream_klines(
     bootstrap_days: int = 1,
     limit: int = 499,
     concurrency: int = 8,
+    stream_flush_size: int = 1000,
+    hot_flush_size: int = 100,
+    hot_flush_interval_seconds: float = 0.5,
     progress_callback: Callable[[StreamProgressEvent], None] | None = None,
+    shutdown_callback: Callable[[str], None] | None = None,
 ) -> StreamResult:
     metadata_store = SymbolMetadataStore(meta_dir)
     active_symbols = [item.symbol for item in metadata_store.load_current_symbols()]
@@ -836,6 +900,16 @@ async def _stream_klines(
         quarantine_dir=quarantine_dir,
         gap_report_path=gap_report_path,
         interval=interval,
+    )
+    live_kline_store = BufferedKlineStore(
+        hot=SqliteKlineHotStore(
+            realtime_closed_db_path
+            or state_dir / f"stream_closed_klines_{interval}.sqlite"
+        ),
+        cold=kline_store,
+        flush_size=stream_flush_size,
+        hot_flush_size=hot_flush_size,
+        stats_callback=make_hot_store_progress_callback(progress_callback),
     )
     open_kline_store = (
         LatestOpenKlineStore(realtime_dir)
@@ -870,7 +944,17 @@ async def _stream_klines(
             checkpoint_callback=checkpoint_callback,
         )
 
+    async def flush_hot_periodically() -> None:
+        try:
+            while True:
+                await asyncio.sleep(hot_flush_interval_seconds)
+                live_kline_store.flush_hot()
+        except asyncio.CancelledError:
+            live_kline_store.flush_hot()
+            raise
+
     startup_task: asyncio.Task[None] | None = None
+    hot_flush_task = asyncio.create_task(flush_hot_periodically())
     if startup_gap_fill:
         startup_checkpoints = dict(checkpoints)
         startup_task = asyncio.create_task(
@@ -903,7 +987,7 @@ async def _stream_klines(
             result = await stream_closed_klines(
                 symbols=selected_symbols,
                 interval=interval,
-                store=kline_store,
+                store=live_kline_store,
                 checkpoints=checkpoints,
                 streams_per_connection=streams_per_connection,
                 checkpoint_callback=checkpoint_callback,
@@ -921,8 +1005,48 @@ async def _stream_klines(
                 return total
             await asyncio.sleep(reconnect_delay_seconds)
     finally:
+        emit_stream_shutdown_message(
+            shutdown_callback,
+            status="requested",
+            stats=live_kline_store.stats(),
+        )
+        if startup_task is not None and not startup_task.done():
+            startup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await startup_task
+        hot_flush_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await hot_flush_task
+        live_kline_store.flush()
         checkpoint_callback.flush()
         checkpoint_store.save(checkpoints)
+        emit_stream_shutdown_message(
+            shutdown_callback,
+            status="complete",
+            stats=live_kline_store.stats(),
+            checkpoints_saved=True,
+        )
+
+
+def emit_stream_shutdown_message(
+    callback: Callable[[str], None] | None,
+    *,
+    status: str,
+    stats: BufferedKlineStoreStats,
+    checkpoints_saved: bool = False,
+) -> None:
+    if callback is None:
+        return
+    message = (
+        f"shutdown={status} "
+        f"sql_buffer={stats.sql_buffer_klines} "
+        f"pending={stats.pending_klines} "
+        f"sqlite_flushes={stats.sqlite_flushes} "
+        f"parquet_flushes={stats.parquet_flushes}"
+    )
+    if checkpoints_saved:
+        message += " checkpoints_saved=1"
+    callback(message)
 
 
 def make_stream_kline_store(
@@ -1026,6 +1150,30 @@ def make_rest_stream_progress_callback(
     return callback
 
 
+def make_hot_store_progress_callback(
+    progress_callback: Callable[[StreamProgressEvent], None] | None,
+) -> Callable[[BufferedKlineStoreStats], None] | None:
+    if progress_callback is None:
+        return None
+
+    def callback(stats: BufferedKlineStoreStats) -> None:
+        progress_callback(
+            StreamProgressEvent(
+                kind="hot_store",
+                symbol="-",
+                klines=0,
+                requests=0,
+                sql_buffer_klines=stats.sql_buffer_klines,
+                sqlite_flushes=stats.sqlite_flushes,
+                pending_klines=stats.pending_klines,
+                parquet_flushes=stats.parquet_flushes,
+                flush_size=stats.flush_size,
+            )
+        )
+
+    return callback
+
+
 def stream_progress_bar() -> Progress:
     return Progress(
         SpinnerColumn(),
@@ -1035,6 +1183,10 @@ def stream_progress_bar() -> Progress:
         TextColumn("ws={task.fields[ws_klines]}"),
         TextColumn("rest={task.fields[rest_klines]}"),
         TextColumn("requests={task.fields[rest_requests]}"),
+        TextColumn("sqlbuf={task.fields[sql_buffer_klines]}"),
+        TextColumn("sqlflush={task.fields[sqlite_flushes]}"),
+        TextColumn("pending={task.fields[pending_klines]}"),
+        TextColumn("pqflush={task.fields[parquet_flushes]}/{task.fields[flush_size]}"),
         TextColumn("current={task.fields[current]}"),
         TimeElapsedColumn(),
     )
@@ -1053,12 +1205,22 @@ def make_stream_progress_callback(
         ws_klines=0,
         rest_klines=0,
         rest_requests=0,
+        sql_buffer_klines=0,
+        sqlite_flushes=0,
+        pending_klines=0,
+        parquet_flushes=0,
+        flush_size=0,
         current="-",
     )
     state = {
         "ws_klines": 0,
         "rest_klines": 0,
         "rest_requests": 0,
+        "sql_buffer_klines": 0,
+        "sqlite_flushes": 0,
+        "pending_klines": 0,
+        "parquet_flushes": 0,
+        "flush_size": 0,
         "current": "-",
         "connections": "-",
         "symbols": symbol_count if symbol_count is not None else "-",
@@ -1074,6 +1236,12 @@ def make_stream_progress_callback(
             state["connections"] = event.connections
         elif event.kind == "metadata" and event.symbols is not None:
             state["symbols"] = event.symbols
+        elif event.kind == "hot_store":
+            state["sql_buffer_klines"] = event.sql_buffer_klines
+            state["sqlite_flushes"] = event.sqlite_flushes
+            state["pending_klines"] = event.pending_klines
+            state["parquet_flushes"] = event.parquet_flushes
+            state["flush_size"] = event.flush_size
         state["current"] = event.symbol
         progress.update(
             task_id,
@@ -1082,6 +1250,11 @@ def make_stream_progress_callback(
             ws_klines=state["ws_klines"],
             rest_klines=state["rest_klines"],
             rest_requests=state["rest_requests"],
+            sql_buffer_klines=state["sql_buffer_klines"],
+            sqlite_flushes=state["sqlite_flushes"],
+            pending_klines=state["pending_klines"],
+            parquet_flushes=state["parquet_flushes"],
+            flush_size=state["flush_size"],
             current=state["current"],
         )
 

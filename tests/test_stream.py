@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 
 import pytest
@@ -150,6 +151,27 @@ async def test_stream_closed_klines_calls_gap_sync_after_disconnected_batch() ->
     )
 
     assert gap_sync_calls == [["BTCUSDT"]]
+
+
+@pytest.mark.asyncio
+async def test_stream_closed_klines_skips_gap_sync_when_cancelled() -> None:
+    async def cancelled_source(url: str):
+        raise asyncio.CancelledError
+        yield
+
+    gap_sync_calls = []
+
+    with pytest.raises(asyncio.CancelledError):
+        await stream_closed_klines(
+            symbols=["BTCUSDT"],
+            interval="1m",
+            store=MemoryStore(),
+            checkpoints={},
+            message_source=cancelled_source,
+            gap_sync_callback=lambda symbols: gap_sync_calls.append(list(symbols)),
+        )
+
+    assert gap_sync_calls == []
 
 
 @pytest.mark.asyncio

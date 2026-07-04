@@ -133,6 +133,7 @@ async def stream_closed_klines(
 
     async def consume_connection(url: str, chunk_symbols: list[str]) -> int:
         saved = 0
+        cancelled = False
         try:
             async for message in source(url):
                 parsed = parse_kline_message(message)
@@ -163,8 +164,11 @@ async def stream_closed_klines(
                             )
                         )
                     saved += saved_count
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
-            if gap_sync_callback is not None:
+            if gap_sync_callback is not None and not cancelled:
                 result = gap_sync_callback(chunk_symbols)
                 if result is not None:
                     await result

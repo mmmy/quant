@@ -1,14 +1,43 @@
 from __future__ import annotations
 
+import sqlite3
 from collections import defaultdict
 from dataclasses import asdict
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Callable
 
 import polars as pl
 
 from quant_binance_sync.models import Kline
 from quant_binance_sync.normalizer import NormalizeResult, normalize_klines
+
+
+KLINE_COLUMNS = [
+    "symbol",
+    "interval",
+    "open_time_ms",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "close_time_ms",
+    "quote_volume",
+    "trade_count",
+    "taker_buy_base_volume",
+    "taker_buy_quote_volume",
+]
+
+
+@dataclass(frozen=True)
+class BufferedKlineStoreStats:
+    sql_buffer_klines: int
+    sqlite_flushes: int
+    pending_klines: int
+    parquet_flushes: int
+    flush_size: int
 
 
 class ParquetKlineStore:
@@ -105,6 +134,229 @@ class NormalizedKlineStore:
             maintain_order=True,
         ).sort(["symbol", "interval", "missing_open_time_ms"])
         frame.write_parquet(self.gap_report_path)
+
+
+class SqliteKlineHotStore:
+    def __init__(self, path: Path | str) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+
+    def upsert_klines(self, klines: list[Kline]) -> None:
+        if not klines:
+            return
+        connection = self._connect()
+        try:
+            connection.executemany(
+                """
+                INSERT INTO closed_klines (
+                    symbol,
+                    interval,
+                    open_time_ms,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    close_time_ms,
+                    quote_volume,
+                    trade_count,
+                    taker_buy_base_volume,
+                    taker_buy_quote_volume
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, interval, open_time_ms) DO UPDATE SET
+                    open = excluded.open,
+                    high = excluded.high,
+                    low = excluded.low,
+                    close = excluded.close,
+                    volume = excluded.volume,
+                    close_time_ms = excluded.close_time_ms,
+                    quote_volume = excluded.quote_volume,
+                    trade_count = excluded.trade_count,
+                    taker_buy_base_volume = excluded.taker_buy_base_volume,
+                    taker_buy_quote_volume = excluded.taker_buy_quote_volume
+                """,
+                [self._to_row(kline) for kline in klines],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def load_klines(
+        self,
+        *,
+        interval: str,
+        symbols: list[str] | None = None,
+    ) -> list[Kline]:
+        query = f"SELECT {', '.join(KLINE_COLUMNS)} FROM closed_klines WHERE interval = ?"
+        params: list[str] = [interval]
+        if symbols is not None:
+            placeholders = ", ".join("?" for _ in symbols)
+            query += f" AND symbol IN ({placeholders})"
+            params.extend(symbols)
+        query += " ORDER BY symbol, open_time_ms"
+        connection = self._connect()
+        try:
+            rows = connection.execute(query, params).fetchall()
+        finally:
+            connection.close()
+        return [self._from_row(row) for row in rows]
+
+    def delete_klines(self, klines: list[Kline]) -> None:
+        if not klines:
+            return
+        connection = self._connect()
+        try:
+            connection.executemany(
+                """
+                DELETE FROM closed_klines
+                WHERE symbol = ? AND interval = ? AND open_time_ms = ?
+                """,
+                [
+                    (kline.symbol, kline.interval, kline.open_time_ms)
+                    for kline in klines
+                ],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _initialize(self) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS closed_klines (
+                    symbol TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    open_time_ms INTEGER NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL,
+                    close_time_ms INTEGER NOT NULL,
+                    quote_volume REAL NOT NULL,
+                    trade_count INTEGER NOT NULL,
+                    taker_buy_base_volume REAL NOT NULL,
+                    taker_buy_quote_volume REAL NOT NULL,
+                    PRIMARY KEY (symbol, interval, open_time_ms)
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.path)
+
+    def _to_row(
+        self,
+        kline: Kline,
+    ) -> tuple[str, str, int, float, float, float, float, float, int, float, int, float, float]:
+        return (
+            kline.symbol,
+            kline.interval,
+            kline.open_time_ms,
+            kline.open,
+            kline.high,
+            kline.low,
+            kline.close,
+            kline.volume,
+            kline.close_time_ms,
+            kline.quote_volume,
+            kline.trade_count,
+            kline.taker_buy_base_volume,
+            kline.taker_buy_quote_volume,
+        )
+
+    def _from_row(self, row: tuple) -> Kline:
+        open_time_ms = int(row[2])
+        return Kline(
+            symbol=str(row[0]),
+            interval=str(row[1]),
+            open_time=datetime.fromtimestamp(open_time_ms / 1000, tz=UTC),
+            open_time_ms=open_time_ms,
+            open=float(row[3]),
+            high=float(row[4]),
+            low=float(row[5]),
+            close=float(row[6]),
+            volume=float(row[7]),
+            close_time_ms=int(row[8]),
+            quote_volume=float(row[9]),
+            trade_count=int(row[10]),
+            taker_buy_base_volume=float(row[11]),
+            taker_buy_quote_volume=float(row[12]),
+        )
+
+
+class BufferedKlineStore:
+    def __init__(
+        self,
+        *,
+        hot: SqliteKlineHotStore,
+        cold,
+        flush_size: int,
+        hot_flush_size: int = 100,
+        stats_callback: Callable[[BufferedKlineStoreStats], None] | None = None,
+    ) -> None:
+        self.hot = hot
+        self.cold = cold
+        self.flush_size = flush_size
+        self.hot_flush_size = hot_flush_size
+        self.stats_callback = stats_callback
+        self._sql_buffer: list[Kline] = []
+        self._pending: list[Kline] = []
+        self._sqlite_flushes = 0
+        self._parquet_flushes = 0
+
+    def upsert_klines(self, klines: list[Kline]) -> NormalizeResult | None:
+        self._sql_buffer.extend(klines)
+        if len(self._sql_buffer) >= self.hot_flush_size:
+            self.flush_hot()
+        if len(self._pending) >= self.flush_size:
+            return self.flush()
+        self._emit_stats()
+        return None
+
+    def flush_hot(self) -> None:
+        if not self._sql_buffer:
+            return
+        buffered = self._sql_buffer
+        self._sql_buffer = []
+        self.hot.upsert_klines(buffered)
+        self._pending.extend(buffered)
+        self._sqlite_flushes += 1
+        self._emit_stats()
+
+    def flush(self) -> NormalizeResult | None:
+        self.flush_hot()
+        if not self._pending:
+            return None
+        pending = self._pending
+        self._pending = []
+        result = self.cold.upsert_klines(pending)
+        self.hot.delete_klines(pending)
+        self._parquet_flushes += 1
+        self._emit_stats()
+        return result
+
+    def _emit_stats(self) -> None:
+        if self.stats_callback is None:
+            return
+        self.stats_callback(self.stats())
+
+    def stats(self) -> BufferedKlineStoreStats:
+        return BufferedKlineStoreStats(
+            sql_buffer_klines=len(self._sql_buffer),
+            sqlite_flushes=self._sqlite_flushes,
+            pending_klines=len(self._pending),
+            parquet_flushes=self._parquet_flushes,
+            flush_size=self.flush_size,
+        )
 
 
 class LatestOpenKlineStore:

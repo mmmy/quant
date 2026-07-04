@@ -5,6 +5,7 @@ from pathlib import Path
 
 import polars as pl
 
+from quant_binance_sync.storage import SqliteKlineHotStore
 from quant_binance_sync.sync import interval_to_milliseconds
 
 
@@ -21,6 +22,7 @@ def build_features(
     base_interval: str = "1m",
     feature_interval: str = "1h",
     symbol: list[str] | None = None,
+    realtime_closed_db_path: Path | str | None = None,
 ) -> FeatureBuildResult:
     silver_path = Path(silver_dir)
     output_path = Path(output_dir)
@@ -29,6 +31,13 @@ def build_features(
         return FeatureBuildResult(rows_written=0, files_written=0)
 
     frame = pl.concat((pl.read_parquet(path) for path in files), how="vertical_relaxed")
+    if realtime_closed_db_path is not None:
+        frame = overlay_realtime_closed_klines(
+            frame,
+            realtime_closed_db_path=Path(realtime_closed_db_path),
+            base_interval=base_interval,
+            symbol=symbol,
+        )
     if symbol is not None:
         frame = frame.filter(pl.col("symbol").is_in(symbol))
     if frame.is_empty():
@@ -43,6 +52,33 @@ def build_features(
         features,
         output_dir=output_path,
         feature_interval=feature_interval,
+    )
+
+
+def overlay_realtime_closed_klines(
+    frame: pl.DataFrame,
+    *,
+    realtime_closed_db_path: Path,
+    base_interval: str,
+    symbol: list[str] | None,
+) -> pl.DataFrame:
+    if not realtime_closed_db_path.exists():
+        return frame
+    hot_klines = SqliteKlineHotStore(realtime_closed_db_path).load_klines(
+        interval=base_interval,
+        symbols=symbol,
+    )
+    if not hot_klines:
+        return frame
+    hot_frame = pl.DataFrame([kline.to_record() for kline in hot_klines])
+    return (
+        pl.concat([frame, hot_frame], how="vertical_relaxed")
+        .sort("open_time_ms")
+        .unique(
+            subset=["symbol", "interval", "open_time_ms"],
+            keep="last",
+            maintain_order=True,
+        )
     )
 
 
