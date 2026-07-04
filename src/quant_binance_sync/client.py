@@ -6,6 +6,17 @@ import httpx
 
 from quant_binance_sync.rate_limit import AsyncWeightRateLimiter, kline_request_weight
 
+TransientRequestError = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.PoolTimeout,
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+)
+
 
 class BinanceFuturesClient:
     def __init__(
@@ -64,7 +75,14 @@ class BinanceFuturesClient:
             if self._rate_limiter is not None:
                 await self._rate_limiter.acquire(weight)
 
-            response = await self._client.request(method, path, **kwargs)
+            try:
+                response = await self._client.request(method, path, **kwargs)
+            except TransientRequestError:
+                if attempt >= self._max_retries:
+                    raise
+                await self._sleep_for(min(60.0, 2.0**attempt))
+                continue
+
             if response.status_code not in {429, 418}:
                 return response
             if attempt >= self._max_retries:

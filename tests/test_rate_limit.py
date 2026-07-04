@@ -85,3 +85,40 @@ async def test_client_retries_429_using_retry_after_header() -> None:
     assert len(route.calls) == 2
     assert clock.sleeps == [2.0]
     assert rows[0][0] == 1719792000000
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_client_retries_read_timeout_with_backoff() -> None:
+    clock = FakeClock()
+    route = respx.get("https://fapi.binance.com/fapi/v1/klines").mock(
+        side_effect=[
+            httpx.ReadTimeout("timed out while reading response"),
+            httpx.Response(
+                200,
+                json=[
+                    [
+                        1719792000000,
+                        "100",
+                        "101",
+                        "99",
+                        "100.5",
+                        "1",
+                        1719792059999,
+                        "100.5",
+                        7,
+                        "0.5",
+                        "50.25",
+                        "0",
+                    ]
+                ],
+            ),
+        ]
+    )
+
+    async with BinanceFuturesClient(sleep=clock.sleep) as client:
+        rows = await client.klines(symbol="BTCUSDT", interval="1m", limit=1500)
+
+    assert len(route.calls) == 2
+    assert clock.sleeps == [1.0]
+    assert rows[0][0] == 1719792000000
