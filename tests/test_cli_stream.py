@@ -8,6 +8,7 @@ from quant_binance_sync.backtest import BacktestResult
 from quant_binance_sync.checkpoints import Checkpoint
 from quant_binance_sync.features import FeatureBuildResult
 from quant_binance_sync.normalize_existing import NormalizeExistingProgress, NormalizeExistingResult
+from quant_binance_sync.relative_strength import RelativeStrengthBuildResult
 from quant_binance_sync.signals import SignalBuildResult
 from quant_binance_sync.storage import NormalizedKlineStore
 from quant_binance_sync.stream import StreamResult, StreamUpdate
@@ -310,6 +311,48 @@ def test_merging_checkpoint_callback_never_moves_live_checkpoint_backward() -> N
     assert saved[-1]["BTCUSDT|1m"] == Checkpoint(last_open_time_ms=2000, status="active")
 
 
+def test_throttled_checkpoint_callback_coalesces_saves_until_flush() -> None:
+    now = 0.0
+    saved = []
+    callback = cli.ThrottledCheckpointCallback(
+        save=lambda checkpoints: saved.append(dict(checkpoints)),
+        monotonic=lambda: now,
+        min_interval_seconds=10.0,
+    )
+
+    callback({"BTCUSDT|1m": Checkpoint(last_open_time_ms=1000, status="active")})
+    callback({"BTCUSDT|1m": Checkpoint(last_open_time_ms=2000, status="active")})
+    now = 5.0
+    callback({"BTCUSDT|1m": Checkpoint(last_open_time_ms=3000, status="active")})
+
+    assert saved == [
+        {"BTCUSDT|1m": Checkpoint(last_open_time_ms=1000, status="active")},
+    ]
+
+    callback.flush()
+
+    assert saved[-1] == {"BTCUSDT|1m": Checkpoint(last_open_time_ms=3000, status="active")}
+
+
+def test_throttled_checkpoint_callback_saves_again_after_interval() -> None:
+    now = 0.0
+    saved = []
+    callback = cli.ThrottledCheckpointCallback(
+        save=lambda checkpoints: saved.append(dict(checkpoints)),
+        monotonic=lambda: now,
+        min_interval_seconds=10.0,
+    )
+
+    callback({"BTCUSDT|1m": Checkpoint(last_open_time_ms=1000, status="active")})
+    now = 10.0
+    callback({"BTCUSDT|1m": Checkpoint(last_open_time_ms=2000, status="active")})
+
+    assert saved == [
+        {"BTCUSDT|1m": Checkpoint(last_open_time_ms=1000, status="active")},
+        {"BTCUSDT|1m": Checkpoint(last_open_time_ms=2000, status="active")},
+    ]
+
+
 def test_make_stream_kline_store_uses_normalized_store_when_silver_dir_is_set(tmp_path) -> None:
     store = cli.make_stream_kline_store(
         data_dir=tmp_path / "raw",
@@ -562,6 +605,371 @@ def test_backtest_report_command_prints_summary(tmp_path, monkeypatch) -> None:
     assert "final_equity=1.1" in result.output
     assert "total_return=" in result.output
     assert "max_drawdown=" in result.output
+
+
+def test_build_relative_strength_command_wires_builder(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def fake_build_relative_strength(**kwargs):
+        calls.append(kwargs)
+        return RelativeStrengthBuildResult(rows_written=7, files_written=1)
+
+    monkeypatch.setattr(cli, "build_relative_strength", fake_build_relative_strength)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "build-relative-strength",
+            "--silver-dir",
+            str(tmp_path / "silver"),
+            "--output-dir",
+            str(tmp_path / "rs"),
+            "--tf",
+            "60",
+            "--btc-symbol",
+            "BTCUSDT",
+            "--max-abs-gap-atr",
+            "2.5",
+            "--max-ret",
+            "0.25",
+            "--tail-bars",
+            "100",
+            "--warmup-bars",
+            "50",
+            "--liquidity-top-n",
+            "100",
+            "--liquidity-lookback-bars",
+            "20",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "rows_written=7 files_written=1" in result.output
+    assert calls == [
+        {
+            "silver_dir": tmp_path / "silver",
+            "output_dir": tmp_path / "rs",
+            "tf": "60",
+            "btc_symbol": "BTCUSDT",
+            "max_abs_gap_atr": 2.5,
+            "max_ret": 0.25,
+            "tail_bars": 100,
+            "warmup_bars": 50,
+            "liquidity_top_n": 100,
+            "liquidity_lookback_bars": 20,
+        }
+    ]
+
+
+def test_build_relative_strength_presets_command_runs_each_preset_tf(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def fake_build_relative_strength(**kwargs):
+        calls.append(kwargs)
+        return RelativeStrengthBuildResult(rows_written=7, files_written=1)
+
+    monkeypatch.setattr(cli, "build_relative_strength", fake_build_relative_strength)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "build-relative-strength-presets",
+            "--preset",
+            "scalp",
+            "--silver-dir",
+            str(tmp_path / "silver"),
+            "--output-dir",
+            str(tmp_path / "rs"),
+            "--btc-symbol",
+            "BTCUSDT",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "tf=1 rows_written=7 files_written=1" in result.output
+    assert "tf=15 rows_written=7 files_written=1" in result.output
+    assert [call["tf"] for call in calls] == ["1", "3", "5", "15"]
+    assert calls[0] == {
+        "silver_dir": tmp_path / "silver",
+        "output_dir": tmp_path / "rs",
+        "tf": "1",
+        "btc_symbol": "BTCUSDT",
+        "max_abs_gap_atr": 1.2,
+        "max_ret": 0.03,
+        "tail_bars": 240,
+        "warmup_bars": 80,
+        "liquidity_top_n": 100,
+        "liquidity_lookback_bars": 240,
+    }
+
+
+def test_build_relative_strength_presets_command_uses_config_file(tmp_path, monkeypatch) -> None:
+    calls = []
+    config_path = tmp_path / "relative_strength_presets.toml"
+    config_path.write_text(
+        """
+[groups]
+custom = ["15"]
+
+[timeframes."15"]
+tail_bars = 88
+warmup_bars = 34
+liquidity_top_n = 55
+liquidity_lookback_bars = 21
+max_abs_gap_atr = 1.6
+max_ret = 0.07
+""",
+        encoding="utf-8",
+    )
+
+    def fake_build_relative_strength(**kwargs):
+        calls.append(kwargs)
+        return RelativeStrengthBuildResult(rows_written=7, files_written=1)
+
+    monkeypatch.setattr(cli, "build_relative_strength", fake_build_relative_strength)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "build-relative-strength-presets",
+            "--preset",
+            "custom",
+            "--config",
+            str(config_path),
+            "--silver-dir",
+            str(tmp_path / "silver"),
+            "--output-dir",
+            str(tmp_path / "rs"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["tf"] == "15"
+    assert calls[0]["tail_bars"] == 88
+    assert calls[0]["warmup_bars"] == 34
+    assert calls[0]["liquidity_top_n"] == 55
+    assert calls[0]["liquidity_lookback_bars"] == 21
+    assert calls[0]["max_abs_gap_atr"] == 1.6
+    assert calls[0]["max_ret"] == 0.07
+
+
+def test_build_relative_strength_presets_command_can_build_single_configured_tf(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calls = []
+    config_path = tmp_path / "relative_strength_presets.toml"
+    config_path.write_text(
+        """
+[timeframes."60"]
+tail_bars = 88
+warmup_bars = 34
+liquidity_top_n = 55
+liquidity_lookback_bars = 21
+max_abs_gap_atr = 1.6
+max_ret = 0.07
+""",
+        encoding="utf-8",
+    )
+
+    def fake_build_relative_strength(**kwargs):
+        calls.append(kwargs)
+        return RelativeStrengthBuildResult(rows_written=7, files_written=1)
+
+    monkeypatch.setattr(cli, "build_relative_strength", fake_build_relative_strength)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "build-relative-strength-presets",
+            "--preset",
+            "intraday",
+            "--tf",
+            "60",
+            "--config",
+            str(config_path),
+            "--silver-dir",
+            str(tmp_path / "silver"),
+            "--output-dir",
+            str(tmp_path / "rs"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert [call["tf"] for call in calls] == ["60"]
+    assert calls[0]["tail_bars"] == 88
+    assert calls[0]["warmup_bars"] == 34
+    assert calls[0]["liquidity_top_n"] == 55
+    assert calls[0]["liquidity_lookback_bars"] == 21
+    assert calls[0]["max_abs_gap_atr"] == 1.6
+    assert calls[0]["max_ret"] == 0.07
+
+
+def test_build_relative_strength_presets_command_dry_run_does_not_build(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def fake_build_relative_strength(**kwargs):
+        calls.append(kwargs)
+        return RelativeStrengthBuildResult(rows_written=7, files_written=1)
+
+    monkeypatch.setattr(cli, "build_relative_strength", fake_build_relative_strength)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "build-relative-strength-presets",
+            "--preset",
+            "scalp",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == []
+    assert "tf=1 tail_bars=240 warmup_bars=80" in result.output
+    assert "max_abs_gap_atr=1.2 max_ret=0.03" in result.output
+
+
+def test_show_relative_strength_command_prints_requested_side(tmp_path) -> None:
+    import polars as pl
+
+    rs_path = tmp_path / "relative_strength.parquet"
+    pl.DataFrame(
+        {
+            "ts_ms": [1000, 1000, 1000],
+            "symbol": ["ETHUSDT", "SOLUSDT", "DOGEUSDT"],
+            "rs_ret": [0.02, -0.01, 0.08],
+            "rs_gap": [0.5, -0.4, 2.0],
+            "strong_rank": [1, None, None],
+            "weak_rank": [None, 1, None],
+            "is_overheated": [False, False, True],
+        }
+    ).write_parquet(rs_path)
+
+    result = runner.invoke(
+        cli.app,
+        ["show-relative-strength", "--path", str(rs_path), "--side", "strong"],
+    )
+
+    assert result.exit_code == 0
+    assert "ETHUSDT" in result.output
+    assert "SOLUSDT" not in result.output
+
+
+def test_show_relative_strength_command_supports_tf_rank_pct_and_top_n(tmp_path) -> None:
+    import polars as pl
+
+    rs_dir = tmp_path / "relative_strength"
+    rs_path = rs_dir / "tf=360" / "relative_strength.parquet"
+    rs_path.parent.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "ts_ms": [1000, 1000, 1000, 1000],
+            "symbol": ["AUSDT", "BUSDT", "CUSDT", "DUSDT"],
+            "rs_ret": [0.04, 0.03, 0.02, 0.01],
+            "rs_gap": [0.4, 0.3, 0.2, 0.1],
+            "strong_rank": [1, 2, 3, 4],
+            "weak_rank": [None, None, None, None],
+            "is_overheated": [False, False, False, False],
+        }
+    ).write_parquet(rs_path)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "show-relative-strength",
+            "--relative-strength-dir",
+            str(rs_dir),
+            "--tf",
+            "360",
+            "--side",
+            "strong",
+            "--rank-pct",
+            "0.5",
+            "--top-n",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "AUSDT" in result.output
+    assert "BUSDT" not in result.output
+
+
+def test_show_relative_strength_command_uses_total_universe_for_rank_pct(tmp_path) -> None:
+    import polars as pl
+
+    rs_path = tmp_path / "relative_strength.parquet"
+    symbols = [f"S{i:02d}USDT" for i in range(100)]
+    strong_ranks = list(range(1, 11)) + [None] * 90
+    pl.DataFrame(
+        {
+            "ts_ms": [1000] * 100,
+            "symbol": symbols,
+            "rs_ret": [0.04] * 10 + [-0.01] * 90,
+            "rs_gap": [0.4] * 10 + [-0.2] * 90,
+            "strong_rank": strong_ranks,
+            "weak_rank": [None] * 100,
+            "is_overheated": [False] * 100,
+        }
+    ).write_parquet(rs_path)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "show-relative-strength",
+            "--path",
+            str(rs_path),
+            "--side",
+            "strong",
+            "--rank-pct",
+            "0.2",
+            "--top-n",
+            "10",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "shape: (10, 6)" in result.output
+
+
+def test_show_relative_strength_command_filters_overheated_by_default(tmp_path) -> None:
+    import polars as pl
+
+    rs_path = tmp_path / "relative_strength.parquet"
+    pl.DataFrame(
+        {
+            "ts_ms": [1000, 1000],
+            "symbol": ["AUSDT", "BUSDT"],
+            "rs_ret": [0.04, 0.03],
+            "rs_gap": [0.4, 0.3],
+            "strong_rank": [1, 2],
+            "weak_rank": [None, None],
+            "is_overheated": [True, False],
+        }
+    ).write_parquet(rs_path)
+
+    default_result = runner.invoke(
+        cli.app,
+        ["show-relative-strength", "--path", str(rs_path), "--side", "strong"],
+    )
+    include_result = runner.invoke(
+        cli.app,
+        [
+            "show-relative-strength",
+            "--path",
+            str(rs_path),
+            "--side",
+            "strong",
+            "--include-overheated",
+        ],
+    )
+
+    assert default_result.exit_code == 0
+    assert "AUSDT" not in default_result.output
+    assert "BUSDT" in default_result.output
+    assert include_result.exit_code == 0
+    assert "AUSDT" in include_result.output
 
 
 def test_normalize_progress_callback_updates_total_completed_and_counts() -> None:

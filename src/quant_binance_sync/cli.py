@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 
 import polars as pl
 import typer
@@ -27,6 +28,11 @@ from quant_binance_sync.checkpoints import CheckpointStore, mark_inactive_checkp
 from quant_binance_sync.features import build_features
 from quant_binance_sync.normalize_existing import NormalizeExistingProgress, normalize_existing_klines
 from quant_binance_sync.rate_limit import AsyncWeightRateLimiter
+from quant_binance_sync.relative_strength import build_relative_strength
+from quant_binance_sync.relative_strength_presets import (
+    resolve_relative_strength_preset_timeframe,
+    resolve_relative_strength_presets,
+)
 from quant_binance_sync.signals import build_signals
 from quant_binance_sync.storage import (
     InMemoryOpenKlineStore,
@@ -54,6 +60,41 @@ class StreamProgressEvent:
     requests: int
     connections: int = 0
     symbols: int | None = None
+
+
+class ThrottledCheckpointCallback:
+    def __init__(
+        self,
+        *,
+        save: Callable[[dict[str, Checkpoint]], None],
+        min_interval_seconds: float = 30.0,
+        monotonic: Callable[[], float] = monotonic,
+    ) -> None:
+        self._save = save
+        self._min_interval_seconds = min_interval_seconds
+        self._monotonic = monotonic
+        self._last_save_at: float | None = None
+        self._pending: dict[str, Checkpoint] | None = None
+        self._dirty = False
+
+    def __call__(self, checkpoints: dict[str, Checkpoint]) -> None:
+        self._pending = dict(checkpoints)
+        now = self._monotonic()
+        if self._last_save_at is None or now - self._last_save_at >= self._min_interval_seconds:
+            self._save_pending(now)
+            return
+        self._dirty = True
+
+    def flush(self) -> None:
+        if self._dirty and self._pending is not None:
+            self._save_pending(self._monotonic())
+
+    def _save_pending(self, now: float) -> None:
+        if self._pending is None:
+            return
+        self._save(self._pending)
+        self._last_save_at = now
+        self._dirty = False
 
 
 def load_interval_checkpoint_store(
@@ -342,6 +383,125 @@ def backtest_report_command(
         typer.echo(f"{key}={value}")
 
 
+@app.command("build-relative-strength")
+def build_relative_strength_command(
+    silver_dir: Path = typer.Option(Path("data/silver/binance/usdm_futures/klines")),
+    output_dir: Path = typer.Option(Path("data/gold/binance/usdm_futures/relative_strength")),
+    tf: str = typer.Option("15", help="Target timeframe: 1, 15, 60, 240, D, etc."),
+    btc_symbol: str = typer.Option("BTCUSDT"),
+    max_abs_gap_atr: float = typer.Option(2.5, min=0.0),
+    max_ret: float | None = typer.Option(None, min=0.0),
+    tail_bars: int | None = typer.Option(None, min=1, help="Only write the latest N target bars."),
+    warmup_bars: int = typer.Option(50, min=0, help="Extra target bars used for EMA/ATR warmup."),
+    liquidity_top_n: int | None = typer.Option(None, min=1),
+    liquidity_lookback_bars: int = typer.Option(20, min=1),
+) -> None:
+    result = build_relative_strength(
+        silver_dir=silver_dir,
+        output_dir=output_dir,
+        tf=tf,
+        btc_symbol=btc_symbol,
+        max_abs_gap_atr=max_abs_gap_atr,
+        max_ret=max_ret,
+        tail_bars=tail_bars,
+        warmup_bars=warmup_bars,
+        liquidity_top_n=liquidity_top_n,
+        liquidity_lookback_bars=liquidity_lookback_bars,
+    )
+    typer.echo(f"rows_written={result.rows_written} files_written={result.files_written}")
+
+
+@app.command("build-relative-strength-presets")
+def build_relative_strength_presets_command(
+    preset: str = typer.Option("intraday", help="Preset group: scalp, intraday, swing, all."),
+    tf: str | None = typer.Option(None, help="Build one configured timeframe instead of a group."),
+    silver_dir: Path = typer.Option(Path("data/silver/binance/usdm_futures/klines")),
+    output_dir: Path = typer.Option(Path("data/gold/binance/usdm_futures/relative_strength")),
+    btc_symbol: str = typer.Option("BTCUSDT"),
+    config: Path | None = typer.Option(None, help="Optional TOML preset config file."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print resolved params without writing."),
+) -> None:
+    try:
+        presets = (
+            [resolve_relative_strength_preset_timeframe(tf, config_path=config)]
+            if tf is not None
+            else resolve_relative_strength_presets(preset, config_path=config)
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--tf" if tf is not None else "--preset") from exc
+
+    for item in presets:
+        if dry_run:
+            typer.echo(
+                f"tf={item.tf} tail_bars={item.tail_bars} warmup_bars={item.warmup_bars} "
+                f"liquidity_top_n={item.liquidity_top_n} "
+                f"liquidity_lookback_bars={item.liquidity_lookback_bars} "
+                f"max_abs_gap_atr={item.max_abs_gap_atr:g} max_ret={item.max_ret:g}"
+            )
+            continue
+        result = build_relative_strength(
+            silver_dir=silver_dir,
+            output_dir=output_dir,
+            tf=item.tf,
+            btc_symbol=btc_symbol,
+            max_abs_gap_atr=item.max_abs_gap_atr,
+            max_ret=item.max_ret,
+            tail_bars=item.tail_bars,
+            warmup_bars=item.warmup_bars,
+            liquidity_top_n=item.liquidity_top_n,
+            liquidity_lookback_bars=item.liquidity_lookback_bars,
+        )
+        typer.echo(
+            f"tf={item.tf} rows_written={result.rows_written} files_written={result.files_written}"
+        )
+
+
+@app.command("show-relative-strength")
+def show_relative_strength_command(
+    path: Path | None = typer.Option(None),
+    relative_strength_dir: Path = typer.Option(
+        Path("data/gold/binance/usdm_futures/relative_strength")
+    ),
+    tf: str = typer.Option("15", help="Target timeframe used when --path is not supplied."),
+    side: str = typer.Option("strong", help="strong or weak"),
+    top_n: int = typer.Option(10, min=1),
+    rank_pct: float = typer.Option(0.2, min=0.0, max=1.0),
+    include_overheated: bool = typer.Option(False, "--include-overheated"),
+    latest: bool = typer.Option(True, "--latest/--all"),
+    limit: int = typer.Option(20, min=1),
+) -> None:
+    if path is None:
+        path = relative_strength_dir / f"tf={tf}" / "relative_strength.parquet"
+    if not path.exists():
+        typer.echo(f"missing_relative_strength={path}")
+        return
+    frame = pl.read_parquet(path)
+    if latest and not frame.is_empty():
+        latest_time = frame.select(pl.col("ts_ms").max()).item()
+        frame = frame.filter(pl.col("ts_ms") == latest_time)
+    rank_col = "strong_rank" if side == "strong" else "weak_rank"
+    if not include_overheated and "is_overheated" in frame.columns:
+        frame = frame.filter(~pl.col("is_overheated"))
+    frame = frame.with_columns(
+        pl.col(rank_col)
+        .rank(descending=False)
+        .over("ts_ms")
+        .cast(pl.Int64)
+        .alias("_display_rank")
+    )
+    universe_count = frame.height
+    max_rank = max(1, int(universe_count * rank_pct)) if rank_pct < 1.0 else universe_count
+    row_limit = min(limit, top_n)
+    view = (
+        frame.filter(pl.col("_display_rank").is_not_null())
+        .filter(pl.col("_display_rank") <= max_rank)
+        .sort("_display_rank")
+        .head(row_limit)
+        .select(["ts_ms", "symbol", "rs_ret", "rs_gap", rank_col, "is_overheated"])
+    )
+    typer.echo(view)
+
+
 def normalize_progress_bar() -> Progress:
     return Progress(
         SpinnerColumn(),
@@ -515,35 +675,39 @@ async def _sync_klines(
         archive_threshold_days=archive_threshold_days,
     )
     progress_context = progress_bar(plan.total_batches) if show_progress else nullcontext(None)
-    with progress_context as progress:
-        callback = (
-            make_progress_callback(progress, total_batches=plan.total_batches)
-            if progress is not None
-            else None
-        )
-        archive_context = (
-            BinanceVisionArchiveClient(cache_dir=archive_cache_dir)
-            if use_archives
-            else nullcontext(None)
-        )
-        async with BinanceFuturesClient(rate_limiter=rate_limiter) as client:
-            async with archive_context as archive_client:
-                result = await sync_missing_klines(
-                    client=client,
-                    store=kline_store,
-                    checkpoints=checkpoints,
-                    interval=interval,
-                    bootstrap_days=bootstrap_days,
-                    limit=limit,
-                    symbols=selected_symbols,
-                    concurrency=concurrency,
-                    progress_callback=callback,
-                    archive_client=archive_client,
-                    archive_threshold_days=archive_threshold_days,
-                    archive_concurrency=archive_concurrency,
-                    checkpoint_callback=checkpoint_store.save,
-                )
-    checkpoint_store.save(checkpoints)
+    checkpoint_callback = ThrottledCheckpointCallback(save=checkpoint_store.save)
+    try:
+        with progress_context as progress:
+            callback = (
+                make_progress_callback(progress, total_batches=plan.total_batches)
+                if progress is not None
+                else None
+            )
+            archive_context = (
+                BinanceVisionArchiveClient(cache_dir=archive_cache_dir)
+                if use_archives
+                else nullcontext(None)
+            )
+            async with BinanceFuturesClient(rate_limiter=rate_limiter) as client:
+                async with archive_context as archive_client:
+                    result = await sync_missing_klines(
+                        client=client,
+                        store=kline_store,
+                        checkpoints=checkpoints,
+                        interval=interval,
+                        bootstrap_days=bootstrap_days,
+                        limit=limit,
+                        symbols=selected_symbols,
+                        concurrency=concurrency,
+                        progress_callback=callback,
+                        archive_client=archive_client,
+                        archive_threshold_days=archive_threshold_days,
+                        archive_concurrency=archive_concurrency,
+                        checkpoint_callback=checkpoint_callback,
+                    )
+    finally:
+        checkpoint_callback.flush()
+        checkpoint_store.save(checkpoints)
     return result
 
 
@@ -585,41 +749,44 @@ async def _sync_all(
             archive_threshold_days=archive_threshold_days,
         )
         progress_context = progress_bar(plan.total_batches) if show_progress else nullcontext(None)
-        with progress_context as progress:
-            callback = (
-                make_progress_callback(progress, total_batches=plan.total_batches)
-                if progress is not None
-                else None
-            )
-            archive_context = (
-                BinanceVisionArchiveClient(cache_dir=archive_cache_dir)
-                if use_archives
-                else nullcontext(None)
-            )
-            async with archive_context as archive_client:
-                result = await sync_missing_klines(
-                    client=client,
-                    store=make_normalized_kline_store(
-                        data_dir=data_dir,
-                        silver_dir=silver_dir,
-                        quarantine_dir=quarantine_dir,
-                        gap_report_path=gap_report_path,
-                        interval=interval,
-                    ),
-                    checkpoints=checkpoints,
-                    interval=interval,
-                    bootstrap_days=bootstrap_days,
-                    limit=limit,
-                    symbols=active_symbols,
-                    concurrency=concurrency,
-                    progress_callback=callback,
-                    archive_client=archive_client,
-                    archive_threshold_days=archive_threshold_days,
-                    archive_concurrency=archive_concurrency,
-                    checkpoint_callback=checkpoint_store.save,
+        checkpoint_callback = ThrottledCheckpointCallback(save=checkpoint_store.save)
+        try:
+            with progress_context as progress:
+                callback = (
+                    make_progress_callback(progress, total_batches=plan.total_batches)
+                    if progress is not None
+                    else None
                 )
-
-    checkpoint_store.save(checkpoints)
+                archive_context = (
+                    BinanceVisionArchiveClient(cache_dir=archive_cache_dir)
+                    if use_archives
+                    else nullcontext(None)
+                )
+                async with archive_context as archive_client:
+                    result = await sync_missing_klines(
+                        client=client,
+                        store=make_normalized_kline_store(
+                            data_dir=data_dir,
+                            silver_dir=silver_dir,
+                            quarantine_dir=quarantine_dir,
+                            gap_report_path=gap_report_path,
+                            interval=interval,
+                        ),
+                        checkpoints=checkpoints,
+                        interval=interval,
+                        bootstrap_days=bootstrap_days,
+                        limit=limit,
+                        symbols=active_symbols,
+                        concurrency=concurrency,
+                        progress_callback=callback,
+                        archive_client=archive_client,
+                        archive_threshold_days=archive_threshold_days,
+                        archive_concurrency=archive_concurrency,
+                        checkpoint_callback=checkpoint_callback,
+                    )
+        finally:
+            checkpoint_callback.flush()
+            checkpoint_store.save(checkpoints)
     return len(active_symbols), result
 
 
@@ -661,6 +828,7 @@ async def _stream_klines(
     checkpoint_store, checkpoints = load_interval_checkpoint_store(state_dir, interval=interval)
     mark_inactive_checkpoints(checkpoints, active_symbols=active_symbols, interval=interval)
     checkpoint_store.save(checkpoints)
+    checkpoint_callback = ThrottledCheckpointCallback(save=checkpoint_store.save)
 
     kline_store = make_stream_kline_store(
         data_dir=data_dir,
@@ -699,7 +867,7 @@ async def _stream_klines(
         await gap_sync_with_checkpoints(
             symbols=symbols,
             gap_checkpoints=checkpoints,
-            checkpoint_callback=checkpoint_store.save,
+            checkpoint_callback=checkpoint_callback,
         )
 
     startup_task: asyncio.Task[None] | None = None
@@ -711,44 +879,50 @@ async def _stream_klines(
                 gap_checkpoints=startup_checkpoints,
                 checkpoint_callback=make_merging_checkpoint_callback(
                     live_checkpoints=checkpoints,
-                    save=checkpoint_store.save,
+                    save=checkpoint_callback,
                 ),
             )
         )
 
     total = StreamResult(connections_seen=0, klines_saved=0)
-    while True:
-        connection_count = (len(selected_symbols) + streams_per_connection - 1) // streams_per_connection
-        if progress_callback is not None:
-            progress_callback(
-                StreamProgressEvent(
-                    kind="connection_batch",
-                    symbol="-",
-                    klines=0,
-                    requests=0,
-                    connections=connection_count,
+    try:
+        while True:
+            connection_count = (
+                len(selected_symbols) + streams_per_connection - 1
+            ) // streams_per_connection
+            if progress_callback is not None:
+                progress_callback(
+                    StreamProgressEvent(
+                        kind="connection_batch",
+                        symbol="-",
+                        klines=0,
+                        requests=0,
+                        connections=connection_count,
+                    )
                 )
+            result = await stream_closed_klines(
+                symbols=selected_symbols,
+                interval=interval,
+                store=kline_store,
+                checkpoints=checkpoints,
+                streams_per_connection=streams_per_connection,
+                checkpoint_callback=checkpoint_callback,
+                gap_sync_callback=gap_sync,
+                progress_callback=make_ws_stream_progress_callback(progress_callback),
+                open_kline_store=open_kline_store,
             )
-        result = await stream_closed_klines(
-            symbols=selected_symbols,
-            interval=interval,
-            store=kline_store,
-            checkpoints=checkpoints,
-            streams_per_connection=streams_per_connection,
-            checkpoint_callback=checkpoint_store.save,
-            gap_sync_callback=gap_sync,
-            progress_callback=make_ws_stream_progress_callback(progress_callback),
-            open_kline_store=open_kline_store,
-        )
-        total = StreamResult(
-            connections_seen=total.connections_seen + result.connections_seen,
-            klines_saved=total.klines_saved + result.klines_saved,
-        )
-        if once:
-            if startup_task is not None:
-                await startup_task
-            return total
-        await asyncio.sleep(reconnect_delay_seconds)
+            total = StreamResult(
+                connections_seen=total.connections_seen + result.connections_seen,
+                klines_saved=total.klines_saved + result.klines_saved,
+            )
+            if once:
+                if startup_task is not None:
+                    await startup_task
+                return total
+            await asyncio.sleep(reconnect_delay_seconds)
+    finally:
+        checkpoint_callback.flush()
+        checkpoint_store.save(checkpoints)
 
 
 def make_stream_kline_store(

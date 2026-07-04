@@ -1,0 +1,165 @@
+[groups]
+scalp = ["1", "3", "5", "15"]
+intraday = ["15", "30", "60", "120", "240", "360"]
+swing = ["240", "360", "720", "D"]
+all = ["1", "2", "3", "4", "5", "8", "10", "15", "20", "30", "45", "60", "90", "120", "180", "240", "360", "480", "720", "D"]
+
+[timeframes."1"]
+tail_bars = 240
+warmup_bars = 80
+liquidity_top_n = 100
+liquidity_lookback_bars = 240
+max_abs_gap_atr = 1.2
+max_ret = 0.03
+
+[timeframes."2"]
+tail_bars = 220
+warmup_bars = 80
+liquidity_top_n = 100
+liquidity_lookback_bars = 200
+max_abs_gap_atr = 1.3
+max_ret = 0.04
+
+[timeframes."3"]
+tail_bars = 200
+warmup_bars = 80
+liquidity_top_n = 100
+liquidity_lookback_bars = 160
+max_abs_gap_atr = 1.4
+max_ret = 0.05
+
+[timeframes."4"]
+tail_bars = 180
+warmup_bars = 80
+liquidity_top_n = 100
+liquidity_lookback_bars = 140
+max_abs_gap_atr = 1.5
+max_ret = 0.055
+
+[timeframes."5"]
+tail_bars = 160
+warmup_bars = 80
+liquidity_top_n = 100
+liquidity_lookback_bars = 120
+max_abs_gap_atr = 1.5
+max_ret = 0.06
+
+[timeframes."8"]
+tail_bars = 140
+warmup_bars = 80
+liquidity_top_n = 100
+liquidity_lookback_bars = 110
+max_abs_gap_atr = 1.6
+max_ret = 0.07
+
+[timeframes."10"]
+tail_bars = 130
+warmup_bars = 80
+liquidity_top_n = 100
+liquidity_lookback_bars = 100
+max_abs_gap_atr = 1.7
+max_ret = 0.075
+
+[timeframes."15"]
+tail_bars = 120
+warmup_bars = 80
+liquidity_top_n = 100
+liquidity_lookback_bars = 96
+max_abs_gap_atr = 1.8
+max_ret = 0.08
+
+[timeframes."20"]
+tail_bars = 110
+warmup_bars = 70
+liquidity_top_n = 100
+liquidity_lookback_bars = 72
+max_abs_gap_atr = 1.9
+max_ret = 0.10
+
+[timeframes."30"]
+tail_bars = 100
+warmup_bars = 60
+liquidity_top_n = 100
+liquidity_lookback_bars = 48
+max_abs_gap_atr = 2.0
+max_ret = 0.12
+
+[timeframes."45"]
+tail_bars = 100
+warmup_bars = 60
+liquidity_top_n = 100
+liquidity_lookback_bars = 48
+max_abs_gap_atr = 2.1
+max_ret = 0.15
+
+[timeframes."60"]
+tail_bars = 100
+warmup_bars = 60
+liquidity_top_n = 100
+liquidity_lookback_bars = 48
+max_abs_gap_atr = 2.2
+max_ret = 0.18
+
+[timeframes."90"]
+tail_bars = 100
+warmup_bars = 60
+liquidity_top_n = 100
+liquidity_lookback_bars = 40
+max_abs_gap_atr = 2.4
+max_ret = 0.22
+
+[timeframes."120"]
+tail_bars = 100
+warmup_bars = 60
+liquidity_top_n = 100
+liquidity_lookback_bars = 36
+max_abs_gap_atr = 2.5
+max_ret = 0.25
+
+[timeframes."180"]
+tail_bars = 100
+warmup_bars = 60
+liquidity_top_n = 100
+liquidity_lookback_bars = 32
+max_abs_gap_atr = 2.8
+max_ret = 0.30
+
+[timeframes."240"]
+tail_bars = 100
+warmup_bars = 60
+liquidity_top_n = 100
+liquidity_lookback_bars = 30
+max_abs_gap_atr = 3.0
+max_ret = 0.35
+
+[timeframes."360"]
+tail_bars = 100
+warmup_bars = 50
+liquidity_top_n = 100
+liquidity_lookback_bars = 20
+max_abs_gap_atr = 3.0
+max_ret = 0.40
+
+[timeframes."480"]
+tail_bars = 100
+warmup_bars = 50
+liquidity_top_n = 100
+liquidity_lookback_bars = 18
+max_abs_gap_atr = 3.2
+max_ret = 0.50
+
+[timeframes."720"]
+tail_bars = 100
+warmup_bars = 50
+liquidity_top_n = 100
+liquidity_lookback_bars = 14
+max_abs_gap_atr = 3.5
+max_ret = 0.60
+
+[timeframes."D"]
+tail_bars = 120
+warmup_bars = 80
+liquidity_top_n = 100
+liquidity_lookback_bars = 30
+max_abs_gap_atr = 4.0
+max_ret = 1.00

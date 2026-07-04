@@ -2,6 +2,9 @@
 
 HTTP-based synchronizer for Binance USD-M USDT perpetual futures klines.
 
+For a beginner-friendly end-to-end workflow, see
+[`docs/beginner-workflow.md`](docs/beginner-workflow.md).
+
 ## Install
 
 ```powershell
@@ -238,4 +241,110 @@ Print the backtest summary:
 
 ```powershell
 uv run quant-binance-sync backtest-report
+```
+
+## BTC relative strength
+
+Build a single-timeframe BTC-relative strength board:
+
+```powershell
+uv run quant-binance-sync build-relative-strength --tf 15
+```
+
+Build multiple practical boards with tuned defaults:
+
+```powershell
+uv run quant-binance-sync build-relative-strength-presets --preset scalp
+uv run quant-binance-sync build-relative-strength-presets --preset intraday
+uv run quant-binance-sync build-relative-strength-presets --preset swing
+uv run quant-binance-sync build-relative-strength-presets --preset all
+```
+
+Preview the resolved parameters without writing files:
+
+```powershell
+uv run quant-binance-sync build-relative-strength-presets --preset intraday --dry-run
+```
+
+Override the built-in defaults with a TOML config:
+
+```powershell
+uv run quant-binance-sync build-relative-strength-presets --preset intraday --config configs/relative_strength_presets.toml
+```
+
+Build one configured timeframe:
+
+```powershell
+uv run quant-binance-sync build-relative-strength-presets --tf 60 --config configs/relative_strength_presets.toml
+```
+
+Preset groups:
+
+```text
+scalp:    1, 3, 5, 15
+intraday: 15, 30, 60, 120, 240, 360
+swing:    240, 360, 720, D
+all:      1, 2, 3, 4, 5, 8, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 360, 480, 720, D
+```
+
+For faster watchlist-style use, build only the latest 100 target bars:
+
+```powershell
+uv run quant-binance-sync build-relative-strength --tf 15 --tail-bars 100 --liquidity-top-n 100
+```
+
+`--warmup-bars` controls how many extra target bars are read for EMA/ATR warmup:
+
+```powershell
+uv run quant-binance-sync build-relative-strength --tf 60 --tail-bars 100 --warmup-bars 50
+```
+
+`--liquidity-top-n` keeps only the highest quote-volume symbols before factor calculation. The
+liquidity universe is measured over the latest `--liquidity-lookback-bars` target candles:
+
+```powershell
+uv run quant-binance-sync build-relative-strength --tf 360 --tail-bars 100 --liquidity-top-n 100 --liquidity-lookback-bars 20
+```
+
+Supported target timeframes:
+
+```text
+1, 2, 3, 4, 5, 8, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 360, 480, 720, D
+```
+
+Source kline selection:
+
+```text
+1, 2, 3, 4, 5, 8, 10, 20 -> silver 1m
+15, 30, 45, 60, 90, 120, 180, 240, 360, 480, 720, D -> silver 15m
+```
+
+The output is written to:
+
+```text
+data/gold/binance/usdm_futures/relative_strength/tf=15/relative_strength.parquet
+```
+
+Show the latest stronger-than-BTC names:
+
+```powershell
+uv run quant-binance-sync show-relative-strength --tf 15 --side strong --rank-pct 0.2 --top-n 10
+```
+
+`--rank-pct 0.2` means "only consider the top 20% of the non-overheated universe",
+then `--top-n 10` prints at most 10 rows from that slice.
+
+Show the latest weaker-than-BTC names:
+
+```powershell
+uv run quant-binance-sync show-relative-strength --tf 15 --side weak --rank-pct 0.2 --top-n 10
+```
+
+`show-relative-strength` filters `is_overheated=true` rows by default. Use
+`--include-overheated` when you want to inspect them too.
+
+Use `--max-abs-gap-atr` and `--max-ret` to exclude names that are already too stretched:
+
+```powershell
+uv run quant-binance-sync build-relative-strength --tf 15 --max-abs-gap-atr 2.5 --max-ret 0.25
 ```
